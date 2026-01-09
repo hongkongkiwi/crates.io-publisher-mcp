@@ -24,18 +24,19 @@ pub struct SearchCratesTool {
 
 impl Default for SearchCratesTool {
     fn default() -> Self {
-        Self::new()
+        Self {
+            inner: Tool::new(Self::NAME, Self::DESC, schema_for::<SearchCratesInput>()),
+        }
     }
 }
 
 impl SearchCratesTool {
-    const NAME: &'static str = "search_crates";
+    pub const NAME: &'static str = "search_crates";
     const DESC: &'static str = "Search for crates on crates.io by name or keyword. Returns a list of matching crates with their descriptions and download counts.";
 
+    #[deprecated(since = "0.1.0", note = "Use Default::default() instead")]
     pub fn new() -> Self {
-        Self {
-            inner: Tool::new(Self::NAME, Self::DESC, schema_for::<SearchCratesInput>()),
-        }
+        Self::default()
     }
 
     pub async fn execute(

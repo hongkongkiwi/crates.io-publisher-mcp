@@ -8,9 +8,10 @@ use rmcp::{
     },
     service::RequestContext,
 };
+use serde::de::DeserializeOwned;
+use serde_json::{Map, Value};
 use std::sync::Arc;
 use std::time::Duration;
-
 pub mod tools;
 
 use tools::{
@@ -43,11 +44,11 @@ impl CratesIoServer {
 
         Ok(Self {
             client,
-            search_crates: Arc::new(SearchCratesTool::new()),
-            get_crate_info: Arc::new(GetCrateInfoTool::new()),
-            get_crate_versions: Arc::new(GetCrateVersionsTool::new()),
-            get_crate_dependencies: Arc::new(GetCrateDependenciesTool::new()),
-            get_crate_documentation: Arc::new(GetCrateDocumentationTool::new()),
+            search_crates: Arc::new(SearchCratesTool::default()),
+            get_crate_info: Arc::new(GetCrateInfoTool::default()),
+            get_crate_versions: Arc::new(GetCrateVersionsTool::default()),
+            get_crate_dependencies: Arc::new(GetCrateDependenciesTool::default()),
+            get_crate_documentation: Arc::new(GetCrateDocumentationTool::default()),
         })
     }
 
@@ -59,6 +60,40 @@ impl CratesIoServer {
             self.get_crate_dependencies.inner.clone(),
             self.get_crate_documentation.inner.clone(),
         ]
+    }
+
+    async fn on_search_crates(&self, args: Map<String, Value>) -> Result<CallToolResult> {
+        let input: SearchCratesInput = Self::deserialize_input(args)?;
+        self.search_crates.execute(&self.client, input).await
+    }
+
+    async fn on_get_crate_info(&self, args: Map<String, Value>) -> Result<CallToolResult> {
+        let input: CrateNameInput = Self::deserialize_input(args)?;
+        self.get_crate_info.execute(&self.client, input).await
+    }
+
+    async fn on_get_crate_versions(&self, args: Map<String, Value>) -> Result<CallToolResult> {
+        let input: CrateNameInput = Self::deserialize_input(args)?;
+        self.get_crate_versions.execute(&self.client, input).await
+    }
+
+    async fn on_get_crate_dependencies(&self, args: Map<String, Value>) -> Result<CallToolResult> {
+        let input: CrateDependenciesInput = Self::deserialize_input(args)?;
+        self.get_crate_dependencies
+            .execute(&self.client, input)
+            .await
+    }
+
+    async fn on_get_crate_documentation(&self, args: Map<String, Value>) -> Result<CallToolResult> {
+        let input: CrateNameInput = Self::deserialize_input(args)?;
+        self.get_crate_documentation
+            .execute(&self.client, input)
+            .await
+    }
+
+    fn deserialize_input<T: DeserializeOwned>(args: Map<String, Value>) -> Result<T, McpError> {
+        serde_json::from_value(Value::Object(args))
+            .map_err(|e| McpError::invalid_params(format!("Invalid parameters: {}", e), None))
     }
 }
 
@@ -103,47 +138,13 @@ impl ServerHandler for CratesIoServer {
             let args = request.arguments.unwrap_or_default();
 
             let result = match name {
-                "search_crates" => {
-                    let input: SearchCratesInput =
-                        serde_json::from_value(serde_json::Value::Object(args)).map_err(|e| {
-                            McpError::invalid_params(format!("Invalid parameters: {}", e), None)
-                        })?;
-                    self.search_crates.execute(&self.client, input).await
-                }
-                "get_crate_info" => {
-                    let input: CrateNameInput =
-                        serde_json::from_value(serde_json::Value::Object(args)).map_err(|e| {
-                            McpError::invalid_params(format!("Invalid parameters: {}", e), None)
-                        })?;
-                    self.get_crate_info.execute(&self.client, input).await
-                }
-                "get_crate_versions" => {
-                    let input: CrateNameInput =
-                        serde_json::from_value(serde_json::Value::Object(args)).map_err(|e| {
-                            McpError::invalid_params(format!("Invalid parameters: {}", e), None)
-                        })?;
-                    self.get_crate_versions.execute(&self.client, input).await
-                }
-                "get_crate_dependencies" => {
-                    let input: CrateDependenciesInput =
-                        serde_json::from_value(serde_json::Value::Object(args)).map_err(|e| {
-                            McpError::invalid_params(format!("Invalid parameters: {}", e), None)
-                        })?;
-                    self.get_crate_dependencies
-                        .execute(&self.client, input)
-                        .await
-                }
-                "get_crate_documentation" => {
-                    let input: CrateNameInput =
-                        serde_json::from_value(serde_json::Value::Object(args)).map_err(|e| {
-                            McpError::invalid_params(format!("Invalid parameters: {}", e), None)
-                        })?;
-                    self.get_crate_documentation
-                        .execute(&self.client, input)
-                        .await
-                }
+                SearchCratesTool::NAME => self.on_search_crates(args).await,
+                GetCrateInfoTool::NAME => self.on_get_crate_info(args).await,
+                GetCrateVersionsTool::NAME => self.on_get_crate_versions(args).await,
+                GetCrateDependenciesTool::NAME => self.on_get_crate_dependencies(args).await,
+                GetCrateDocumentationTool::NAME => self.on_get_crate_documentation(args).await,
                 _ => {
-                    return Err(McpError::invalid_params(
+                    return Err(McpError::internal_error(
                         format!("Unknown tool: {}", name),
                         None,
                     ));

@@ -19,15 +19,6 @@ pub struct GetCrateDependenciesTool {
 
 impl Default for GetCrateDependenciesTool {
     fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl GetCrateDependenciesTool {
-    const NAME: &'static str = "get_crate_dependencies";
-    const DESC: &'static str = "Get the dependencies of a specific crate version. Returns both required and optional dependencies with their version requirements.";
-
-    pub fn new() -> Self {
         Self {
             inner: Tool::new(
                 Self::NAME,
@@ -35,6 +26,16 @@ impl GetCrateDependenciesTool {
                 schema_for::<CrateDependenciesInput>(),
             ),
         }
+    }
+}
+
+impl GetCrateDependenciesTool {
+    pub const NAME: &'static str = "get_crate_dependencies";
+    const DESC: &'static str = "Get the dependencies of a specific crate version. Returns both required and optional dependencies with their version requirements.";
+
+    #[deprecated(since = "0.1.0", note = "Use Default::default() instead")]
+    pub fn new() -> Self {
+        Self::default()
     }
 
     pub async fn execute(

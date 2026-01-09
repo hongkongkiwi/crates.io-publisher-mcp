@@ -10,18 +10,19 @@ pub struct GetCrateVersionsTool {
 
 impl Default for GetCrateVersionsTool {
     fn default() -> Self {
-        Self::new()
+        Self {
+            inner: Tool::new(Self::NAME, Self::DESC, schema_for::<CrateNameInput>()),
+        }
     }
 }
 
 impl GetCrateVersionsTool {
-    const NAME: &'static str = "get_crate_versions";
+    pub const NAME: &'static str = "get_crate_versions";
     const DESC: &'static str = "Get a list of all published versions of a crate, including version numbers, publication dates, and download counts.";
 
+    #[deprecated(since = "0.1.0", note = "Use Default::default() instead")]
     pub fn new() -> Self {
-        Self {
-            inner: Tool::new(Self::NAME, Self::DESC, schema_for::<CrateNameInput>()),
-        }
+        Self::default()
     }
 
     pub async fn execute(

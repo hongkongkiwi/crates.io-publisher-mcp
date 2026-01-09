@@ -17,18 +17,19 @@ pub struct GetCrateInfoTool {
 
 impl Default for GetCrateInfoTool {
     fn default() -> Self {
-        Self::new()
+        Self {
+            inner: Tool::new(Self::NAME, Self::DESC, schema_for::<CrateNameInput>()),
+        }
     }
 }
 
 impl GetCrateInfoTool {
-    const NAME: &'static str = "get_crate_info";
+    pub const NAME: &'static str = "get_crate_info";
     const DESC: &'static str = "Get detailed information about a specific crate including description, homepage, repository, downloads, and latest version.";
 
+    #[deprecated(since = "0.1.0", note = "Use Default::default() instead")]
     pub fn new() -> Self {
-        Self {
-            inner: Tool::new(Self::NAME, Self::DESC, schema_for::<CrateNameInput>()),
-        }
+        Self::default()
     }
 
     pub async fn execute(
