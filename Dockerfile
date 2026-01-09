@@ -1,5 +1,5 @@
 # Build stage
-FROM rust:1.85-slim AS builder
+FROM rust:1.88-slim AS builder
 
 WORKDIR /app
 
@@ -30,4 +30,4 @@ USER mcp
 EXPOSE 3000
 
 # Default to stdio mode, override with: docker run cratesdotio-mcp --http
-CMD ["cratesdotio-mcp"]
+ENTRYPOINT ["cratesdotio-mcp"]

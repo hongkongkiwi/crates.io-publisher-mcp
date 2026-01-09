@@ -8,7 +8,7 @@ edition = "2024"
 rmcp = { version = "0.12.0", features = ["server", "macros", "transport-io", "transport-streamable-http-server", "transport-streamable-http-server-session"] }
 
 # Crates.io API client
-crates_io_api = "0.11"
+crates_io_api = "0.12"
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
@@ -28,7 +28,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # JSON Schema for tool parameters
-schemars = "0.8"
+schemars = "1.2"
 
 # CLI Argument Parsing
 clap = { version = "4.5.54", features = ["derive"] }

@@ -42,11 +42,8 @@ cargo build --release
 ```bash
 docker build -t cratesdotio-mcp .
 
-# HTTP mode
-docker run -p 3000:3000 cratesdotio-mcp --http
-
 # HTTP mode (custom port)
-docker run -p 8080:8080 cratesdotio-mcp --http 8080
+docker run -d -p 8080:8080 cratesdotio-mcp --http 8080
 
 # Stdio mode
 docker run -i cratesdotio-mcp
