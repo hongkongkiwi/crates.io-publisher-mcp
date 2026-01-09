@@ -1,7 +1,7 @@
 use anyhow::Result;
 use crates_io_api::{AsyncClient, CratesQuery, Sort};
 use rmcp::{
-    Error as McpError, RoleServer, ServerHandler,
+    ErrorData as McpError, RoleServer, ServerHandler,
     model::{
         CallToolRequestParam, CallToolResult, Content, ListToolsResult, PaginatedRequestParam,
         ServerCapabilities, ServerInfo, Tool,

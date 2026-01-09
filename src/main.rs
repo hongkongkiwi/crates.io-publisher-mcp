@@ -1,4 +1,5 @@
 use anyhow::Result;
+use clap::Parser;
 use cratesdotio_mcp::CratesIoServer;
 use rmcp::ServiceExt;
 use rmcp::transport::stdio;
@@ -6,30 +7,35 @@ use rmcp::transport::streamable_http_server::session::local::LocalSessionManager
 use rmcp::transport::streamable_http_server::tower::{
     StreamableHttpServerConfig, StreamableHttpService,
 };
-use std::env;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-fn print_usage() {
-    eprintln!("Usage: cratesdotio-mcp [OPTIONS]");
-    eprintln!();
-    eprintln!("Options:");
-    eprintln!("  --http [PORT]  Start HTTP/SSE server (default port: 3000)");
-    eprintln!("  --help         Show this help message");
-    eprintln!();
-    eprintln!("Without --http, the server uses stdio transport for MCP clients.");
+#[derive(Parser)]
+#[command(author, version, about, long_about = None)]
+struct Cli {
+    /// Start HTTP/SSE server on the specified port.
+    /// If no port is specified, it defaults to 3000.
+    #[arg(long, value_name = "PORT", num_args = 0..=1, default_missing_value = "3000")]
+    http: Option<u16>,
+
+    /// Start HTTP/SSE server on PORT (alternative flag style if user wants just --http without value, handling might be tricky with Option<u16>,
+    /// better to use a flag and a separate port option, OR use `num_args` and `default_missing_value` as above.
+    /// The user seemingly wants `--http [PORT]` where PORT is optional.
+    /// `clap` handles optional values for flags with `num_args`.
+    /// However, usually `--http 8080` or just `--http` (implying default)
+    /// The previous manual parsing was `--http [PORT]` checking next arg.
+    /// `default_missing_value` works if the flag is present but no value is provided.
+    /// If the flag is NOT present, `http` will be None.
+    /// This matches the previous `if let Some(idx) = http_index` logic.
+    #[arg(skip)]
+    _dummy: (), // field to allow comments/attributes above to not look weird
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let args: Vec<String> = env::args().collect();
+    // Parse args
+    let cli = Cli::parse();
 
-    // Check for help
-    if args.iter().any(|a| a == "--help" || a == "-h") {
-        print_usage();
-        return Ok(());
-    }
-
-    // Initialize logging to stderr (stdout is used for MCP communication in stdio mode)
+    // Initialize logging
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
@@ -37,17 +43,9 @@ async fn main() -> Result<()> {
         .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
         .init();
 
-    // Check for --http flag and optional port argument
-    let http_index = args.iter().position(|a| a == "--http");
-
-    if let Some(idx) = http_index {
-        // Get port from next argument, or default to 3000
-        let port = args
-            .get(idx + 1)
-            .and_then(|s| s.parse::<u16>().ok())
-            .unwrap_or(3000);
-
-        // Bind to IPv6 Unspecified (::) to allow dual-stack (IPv4 and IPv6) connections
+    if let Some(port) = cli.http {
+        // HTTP Mode
+        // Bind to IPv6 Unspecified (::) for dual-stack
         let bind_addr = std::net::SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, port));
 
         tracing::info!(
@@ -55,8 +53,7 @@ async fn main() -> Result<()> {
             bind_addr
         );
 
-        let server_factory =
-            || CratesIoServer::new().map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e));
+        let server_factory = || CratesIoServer::new().map_err(std::io::Error::other);
         let session_manager = std::sync::Arc::new(LocalSessionManager::default());
         let config = StreamableHttpServerConfig::default();
 
@@ -72,6 +69,7 @@ async fn main() -> Result<()> {
 
         axum::serve(listener, app).await?;
     } else {
+        // Stdio Mode
         tracing::info!("Starting crates.io MCP server with stdio transport");
 
         let server = CratesIoServer::new()?;

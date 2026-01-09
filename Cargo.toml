@@ -29,3 +29,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # JSON Schema for tool parameters
 schemars = "0.8"
+
+# CLI Argument Parsing
+clap = { version = "4.5.54", features = ["derive"] }

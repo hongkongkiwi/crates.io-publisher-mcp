@@ -2,6 +2,12 @@
 
 MCP server for interacting with [crates.io](https://crates.io).
 
+This mcp tool can be useful to define rules on your AI agent in order to:
+- Use always the latest version of a crate
+- Retrieve the github repository of a crate
+- Access brief description of what a crate does
+- Access dependencies of a crate
+
 ## Tools
 
 - `search_crates` - Search crates by name/keyword
@@ -48,16 +54,7 @@ docker run -p 8080:8080 cratesdotio-mcp --http 8080
 
 ## MCP Configuration
 
-### Stdio (local binary)
-```json
-{
-  "mcpServers": {
-    "crates-io": {
-      "command": "/path/to/cratesdotio-mcp"
-    }
-  }
-}
-```
+Make sure that the mcp server is running **BEFORE** starting/configuring your AI agent in the editor: this will make sure that the initial session handshake is successful.
 
 ### HTTP (local or Docker)
 ```json
@@ -69,3 +66,16 @@ docker run -p 8080:8080 cratesdotio-mcp --http 8080
   }
 }
 ```
+
+### Stdio (local binary)
+```json
+{
+  "mcpServers": {
+    "crates-io": {
+      "command": "/path/to/cratesdotio-mcp"
+    }
+  }
+}
+```
+
+
