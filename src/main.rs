@@ -1,8 +1,11 @@
 use anyhow::Result;
 use cratesdotio_mcp::CratesIoServer;
 use rmcp::ServiceExt;
-use rmcp::transport::sse_server::SseServer;
 use rmcp::transport::stdio;
+use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
+use rmcp::transport::streamable_http_server::tower::{
+    StreamableHttpServerConfig, StreamableHttpService,
+};
 use std::env;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -44,25 +47,30 @@ async fn main() -> Result<()> {
             .and_then(|s| s.parse::<u16>().ok())
             .unwrap_or(3000);
 
-        let bind_addr: std::net::SocketAddr = format!("0.0.0.0:{}", port).parse()?;
+        // Bind to IPv6 Unspecified (::) to allow dual-stack (IPv4 and IPv6) connections
+        let bind_addr = std::net::SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, port));
 
         tracing::info!(
             "Starting crates.io MCP server with HTTP/SSE transport on {}",
             bind_addr
         );
 
-        let sse_server = SseServer::serve(bind_addr).await?;
+        let server_factory =
+            || CratesIoServer::new().map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e));
+        let session_manager = std::sync::Arc::new(LocalSessionManager::default());
+        let config = StreamableHttpServerConfig::default();
 
-        // with_service takes a factory that creates a new server for each connection
-        let ct =
-            sse_server.with_service(|| CratesIoServer::new().expect("Failed to create server"));
+        let service = StreamableHttpService::new(server_factory, session_manager, config);
+
+        let app = axum::Router::new().fallback_service(service);
+
+        let listener = tokio::net::TcpListener::bind(bind_addr).await?;
 
         tracing::info!("Server running on http://localhost:{}", port);
         tracing::info!("  SSE endpoint: http://localhost:{}/sse", port);
         tracing::info!("  POST endpoint: http://localhost:{}/message", port);
 
-        // Wait for cancellation
-        ct.cancelled().await;
+        axum::serve(listener, app).await?;
     } else {
         tracing::info!("Starting crates.io MCP server with stdio transport");
 

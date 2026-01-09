@@ -10,7 +10,6 @@ use rmcp::{
 };
 use schemars::JsonSchema;
 use serde::Deserialize;
-use std::borrow::Cow;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -70,41 +69,31 @@ impl CratesIoServer {
 
     fn tools() -> Vec<Tool> {
         vec![
-            Tool {
-                name: Cow::Borrowed("search_crates"),
-                description: Cow::Borrowed(
-                    "Search for crates on crates.io by name or keyword. Returns a list of matching crates with their descriptions and download counts.",
-                ),
-                input_schema: schema_for::<SearchCratesInput>(),
-            },
-            Tool {
-                name: Cow::Borrowed("get_crate_info"),
-                description: Cow::Borrowed(
-                    "Get detailed information about a specific crate including description, homepage, repository, downloads, and latest version.",
-                ),
-                input_schema: schema_for::<CrateNameInput>(),
-            },
-            Tool {
-                name: Cow::Borrowed("get_crate_versions"),
-                description: Cow::Borrowed(
-                    "Get a list of all published versions of a crate, including version numbers, publication dates, and download counts.",
-                ),
-                input_schema: schema_for::<CrateNameInput>(),
-            },
-            Tool {
-                name: Cow::Borrowed("get_crate_dependencies"),
-                description: Cow::Borrowed(
-                    "Get the dependencies of a specific crate version. Returns both required and optional dependencies with their version requirements.",
-                ),
-                input_schema: schema_for::<CrateDependenciesInput>(),
-            },
-            Tool {
-                name: Cow::Borrowed("get_crate_documentation"),
-                description: Cow::Borrowed(
-                    "Get the documentation URL for a crate. Returns the official docs.rs link and any custom documentation URL specified by the crate author.",
-                ),
-                input_schema: schema_for::<CrateNameInput>(),
-            },
+            Tool::new(
+                "search_crates",
+                "Search for crates on crates.io by name or keyword. Returns a list of matching crates with their descriptions and download counts.",
+                schema_for::<SearchCratesInput>(),
+            ),
+            Tool::new(
+                "get_crate_info",
+                "Get detailed information about a specific crate including description, homepage, repository, downloads, and latest version.",
+                schema_for::<CrateNameInput>(),
+            ),
+            Tool::new(
+                "get_crate_versions",
+                "Get a list of all published versions of a crate, including version numbers, publication dates, and download counts.",
+                schema_for::<CrateNameInput>(),
+            ),
+            Tool::new(
+                "get_crate_dependencies",
+                "Get the dependencies of a specific crate version. Returns both required and optional dependencies with their version requirements.",
+                schema_for::<CrateDependenciesInput>(),
+            ),
+            Tool::new(
+                "get_crate_documentation",
+                "Get the documentation URL for a crate. Returns the official docs.rs link and any custom documentation URL specified by the crate author.",
+                schema_for::<CrateNameInput>(),
+            ),
         ]
     }
 
@@ -378,13 +367,14 @@ impl ServerHandler for CratesIoServer {
 
     fn list_tools(
         &self,
-        _request: PaginatedRequestParam,
+        _request: Option<PaginatedRequestParam>,
         _context: RequestContext<RoleServer>,
     ) -> impl std::future::Future<Output = Result<ListToolsResult, McpError>> + Send + '_ {
         async {
             Ok(ListToolsResult {
                 tools: Self::tools(),
                 next_cursor: None,
+                meta: None,
             })
         }
     }
@@ -553,7 +543,10 @@ mod tests {
         let tools = CratesIoServer::tools();
         for tool in tools {
             assert!(
-                !tool.description.is_empty(),
+                tool.description
+                    .as_ref()
+                    .map(|d| !d.is_empty())
+                    .unwrap_or(false),
                 "Tool {} should have description",
                 tool.name
             );
