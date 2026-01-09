@@ -7,7 +7,7 @@ license = "MIT"
 repository = "https://github.com/fedemagnani/crates.io-mcp"
 readme = "README.md"
 keywords = ["mcp", "crates-io", "tool", "ai", "llm"]
-categories = ["development-tools", "api-bindings", "mcp", "ai", "llm"]
+categories = ["development-tools", "api-bindings", "config", "command-line-utilities"]
 
 [dependencies]
 rmcp = { version = "0.12.0", features = ["server", "macros", "transport-io", "transport-streamable-http-server", "transport-streamable-http-server-session"] }
