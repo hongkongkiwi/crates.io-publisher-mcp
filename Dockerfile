@@ -29,5 +29,7 @@ USER mcp
 # Expose HTTP port (for --http mode)
 EXPOSE 3000
 
-# Default to stdio mode, override with: docker run cratesdotio-mcp --http
-ENTRYPOINT ["cratesdotio-mcp"]
+# Runs read-only over HTTP. Write and publish modes are stdio-only because they
+# need the crate on the same filesystem as cargo, and a write-capable server
+# refuses a non-loopback HTTP bind.
+ENTRYPOINT ["cratesdotio-mcp", "--mode", "read-only"]
