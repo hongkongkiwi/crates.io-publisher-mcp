@@ -6,6 +6,10 @@ use std::time::Duration;
 
 const BIN: &str = env!("CARGO_BIN_EXE_cratesdotio-mcp");
 
+fn test_dir(name: &str) -> std::path::PathBuf {
+    std::env::temp_dir().join(name)
+}
+
 struct Session {
     child: Child,
     stdin: ChildStdin,
@@ -13,7 +17,12 @@ struct Session {
 }
 
 impl Session {
-    fn start(mode: &str, token: Option<&str>) -> Self {
+    fn start_with_cargo_home(
+        mode: &str,
+        token: Option<&str>,
+        cookie: Option<&str>,
+        cargo_home: std::path::PathBuf,
+    ) -> Self {
         let mut command = Command::new(BIN);
         command
             .arg("--mode")
@@ -21,16 +30,19 @@ impl Session {
             .env_remove("CRATES_MCP_MODE")
             .env_remove("CRATES_IO_TOKEN")
             .env_remove("CARGO_REGISTRY_TOKEN")
-            .env(
-                "CARGO_HOME",
-                std::env::temp_dir().join("crates-mcp-test-home"),
-            )
+            .env_remove("CRATES_IO_COOKIE")
+            .env_remove("CRATES_IO_COOKIE_FILE")
+            .env("CARGO_HOME", cargo_home)
+            .env("CRATES_MCP_CONFIG_DIR", test_dir("crates-mcp-test-config"))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
 
         if let Some(token) = token {
             command.env("CRATES_IO_TOKEN", token);
+        }
+        if let Some(cookie) = cookie {
+            command.env("CRATES_IO_COOKIE", cookie);
         }
 
         let mut child = command.spawn().expect("server binary starts");
@@ -91,8 +103,17 @@ impl Drop for Session {
     }
 }
 
-fn tool_names(mode: &str, token: Option<&str>) -> Vec<String> {
-    let mut session = Session::start(mode, token);
+fn tool_names(mode: &str, token: Option<&str>, cookie: Option<&str>) -> Vec<String> {
+    tool_names_with_cargo_home(mode, token, cookie, test_dir("crates-mcp-test-home"))
+}
+
+fn tool_names_with_cargo_home(
+    mode: &str,
+    token: Option<&str>,
+    cookie: Option<&str>,
+    cargo_home: std::path::PathBuf,
+) -> Vec<String> {
+    let mut session = Session::start_with_cargo_home(mode, token, cookie, cargo_home);
 
     session.send(json!({
         "jsonrpc": "2.0",
@@ -121,30 +142,48 @@ fn tool_names(mode: &str, token: Option<&str>) -> Vec<String> {
 
 #[test]
 fn read_only_mode_exposes_only_read_tools() {
-    let tools = tool_names("read-only", None);
+    let tools = tool_names("read-only", None, None);
     assert_eq!(tools.len(), 7, "{tools:?}");
     assert!(tools.contains(&"search_crates".to_string()));
     assert!(tools.contains(&"crates_auth_status".to_string()));
     assert!(!tools.contains(&"yank_crate_version".to_string()));
     assert!(!tools.contains(&"publish_crate".to_string()));
+    assert!(!tools.contains(&"delete_crate".to_string()));
 }
 
 #[test]
 fn write_mode_adds_write_tools_but_not_publish() {
-    let tools = tool_names("write", Some("fake-token"));
+    let tools = tool_names("write", Some("fake-token"), None);
     assert_eq!(tools.len(), 16, "{tools:?}");
     assert!(tools.contains(&"yank_crate_version".to_string()));
     assert!(tools.contains(&"set_trustpub_only".to_string()));
     assert!(!tools.contains(&"publish_crate".to_string()));
+    assert!(!tools.contains(&"delete_crate".to_string()));
 }
 
 #[test]
 fn publish_mode_exposes_every_tool() {
-    let tools = tool_names("publish", Some("fake-token"));
+    let tools = tool_names("publish", Some("fake-token"), None);
     assert_eq!(tools.len(), 19, "{tools:?}");
     assert!(tools.contains(&"scaffold_crate".to_string()));
     assert!(tools.contains(&"publish_crate".to_string()));
     assert!(tools.contains(&"generate_publish_workflow".to_string()));
+    assert!(!tools.contains(&"delete_crate".to_string()));
+}
+
+#[test]
+fn admin_mode_adds_account_tools() {
+    let with_token = tool_names("admin", Some("fake-token"), Some("fake-cookie"));
+    assert_eq!(with_token.len(), 24, "{with_token:?}");
+    assert!(with_token.contains(&"crates_whoami".to_string()));
+    assert!(with_token.contains(&"create_api_token".to_string()));
+    assert!(with_token.contains(&"delete_crate".to_string()));
+    assert!(with_token.contains(&"publish_crate".to_string()));
+
+    let cookie_only = tool_names("admin", None, Some("fake-cookie"));
+    assert_eq!(cookie_only.len(), 12, "{cookie_only:?}");
+    assert!(cookie_only.contains(&"delete_crate".to_string()));
+    assert!(!cookie_only.contains(&"publish_crate".to_string()));
 }
 
 #[test]
@@ -166,10 +205,8 @@ fn write_mode_refuses_to_start_without_a_token() {
         .env_remove("CRATES_MCP_MODE")
         .env_remove("CRATES_IO_TOKEN")
         .env_remove("CARGO_REGISTRY_TOKEN")
-        .env(
-            "CARGO_HOME",
-            std::env::temp_dir().join("crates-mcp-test-home"),
-        )
+        .env("CARGO_HOME", test_dir("crates-mcp-test-home"))
+        .env("CRATES_MCP_CONFIG_DIR", test_dir("crates-mcp-test-config"))
         .output()
         .expect("binary runs");
 
@@ -179,10 +216,55 @@ fn write_mode_refuses_to_start_without_a_token() {
 }
 
 #[test]
+fn admin_mode_refuses_to_start_without_a_session_cookie() {
+    let output = Command::new(BIN)
+        .args(["--mode", "admin"])
+        .env_remove("CRATES_MCP_MODE")
+        .env_remove("CRATES_IO_COOKIE")
+        .env_remove("CRATES_IO_COOKIE_FILE")
+        .env_remove("CRATES_IO_TOKEN")
+        .env("CARGO_HOME", test_dir("crates-mcp-test-home"))
+        .env("CRATES_MCP_CONFIG_DIR", test_dir("crates-mcp-test-config"))
+        .output()
+        .expect("binary runs");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("session cookie"), "{stderr}");
+}
+
+#[test]
+fn admin_mode_ignores_a_broken_cargo_credentials_file() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("credentials.toml"), "not = [valid").unwrap();
+
+    let tools =
+        tool_names_with_cargo_home("admin", None, Some("fake-cookie"), dir.path().to_path_buf());
+
+    assert_eq!(tools.len(), 12, "{tools:?}");
+    assert!(tools.contains(&"crates_whoami".to_string()));
+}
+
+#[test]
+fn admin_mode_refuses_a_non_loopback_http_bind() {
+    let output = Command::new(BIN)
+        .args(["--mode", "admin", "--http", "0", "--bind", "0.0.0.0"])
+        .env("CRATES_IO_COOKIE", "fake-cookie")
+        .env("CRATES_MCP_CONFIG_DIR", test_dir("crates-mcp-test-config"))
+        .output()
+        .expect("binary runs");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("must bind to loopback"), "{stderr}");
+}
+
+#[test]
 fn write_mode_refuses_a_non_loopback_http_bind() {
     let output = Command::new(BIN)
         .args(["--mode", "write", "--http", "0", "--bind", "0.0.0.0"])
         .env("CRATES_IO_TOKEN", "fake-token")
+        .env("CRATES_MCP_CONFIG_DIR", test_dir("crates-mcp-test-config"))
         .output()
         .expect("binary runs");
 

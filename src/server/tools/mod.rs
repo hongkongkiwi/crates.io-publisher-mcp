@@ -2,6 +2,7 @@ use crate::mode::Mode;
 use schemars::JsonSchema;
 use std::sync::Arc;
 
+pub mod admin;
 pub mod dependencies;
 pub mod documentation;
 pub mod info;
@@ -10,6 +11,7 @@ pub mod search;
 pub mod versions;
 pub mod write;
 
+pub use admin::AdminTools;
 pub use dependencies::GetCrateDependenciesTool;
 pub use documentation::GetCrateDocumentationTool;
 pub use info::GetCrateInfoTool;
@@ -44,6 +46,11 @@ pub fn required_mode(name: &str) -> Option<Mode> {
         PublishTools::SCAFFOLD | PublishTools::PUBLISH | PublishTools::WORKFLOW => {
             Some(Mode::Publish)
         }
+        AdminTools::WHOAMI
+        | AdminTools::LIST_TOKENS
+        | AdminTools::CREATE_TOKEN
+        | AdminTools::REVOKE_TOKEN
+        | AdminTools::DELETE_CRATE => Some(Mode::Admin),
         _ => None,
     }
 }
@@ -74,6 +81,9 @@ mod tests {
         assert_eq!(required_mode(PublishTools::SCAFFOLD), Some(Mode::Publish));
         assert_eq!(required_mode(PublishTools::PUBLISH), Some(Mode::Publish));
         assert_eq!(required_mode(PublishTools::WORKFLOW), Some(Mode::Publish));
+        assert_eq!(required_mode(AdminTools::WHOAMI), Some(Mode::Admin));
+        assert_eq!(required_mode(AdminTools::CREATE_TOKEN), Some(Mode::Admin));
+        assert_eq!(required_mode(AdminTools::DELETE_CRATE), Some(Mode::Admin));
         assert_eq!(required_mode("not_a_tool"), None);
     }
 }

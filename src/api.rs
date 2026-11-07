@@ -32,6 +32,17 @@ pub struct WriteClient {
     base_url: String,
 }
 
+fn build_http_client() -> Result<Client> {
+    Client::builder()
+        .user_agent(USER_AGENT)
+        .timeout(Duration::from_secs(30))
+        // A redirect could downgrade https to http on the same host, and
+        // reqwest keeps the Authorization header across that redirect.
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .context("building crates.io HTTP client")
+}
+
 impl WriteClient {
     pub fn new(token: &str, base_url: &str) -> Result<Self> {
         if token.trim().is_empty() {
@@ -39,17 +50,8 @@ impl WriteClient {
         }
         validate_base_url(base_url)?;
 
-        let http = Client::builder()
-            .user_agent(USER_AGENT)
-            .timeout(Duration::from_secs(30))
-            // A redirect could downgrade https to http on the same host, and
-            // reqwest keeps the Authorization header across that redirect.
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .context("building crates.io HTTP client")?;
-
         Ok(Self {
-            http,
+            http: build_http_client()?,
             token: token.to_string(),
             base_url: base_url.trim_end_matches('/').to_string(),
         })
@@ -182,6 +184,202 @@ impl WriteClient {
         self.send_empty(self.http.patch(self.crate_url(name)).json(&body))
             .await
     }
+}
+
+/// Client for cookie-only crates.io endpoints.
+///
+/// The cookie is full account authority. It is only constructed in admin mode.
+pub struct SessionClient {
+    http: Client,
+    cookie: String,
+    base_url: String,
+}
+
+impl SessionClient {
+    pub fn new(cookie: &str, base_url: &str) -> Result<Self> {
+        if cookie.trim().is_empty() {
+            anyhow::bail!("crates.io session cookie is empty");
+        }
+        // The cookie is full account authority. Do not allow the loopback
+        // plaintext exception that the scoped-token client uses for tests.
+        if !base_url.starts_with("https://") {
+            anyhow::bail!("the crates.io session cookie is only sent over https; got `{base_url}`");
+        }
+        validate_base_url(base_url)?;
+
+        Ok(Self {
+            http: build_http_client()?,
+            cookie: cookie.to_string(),
+            base_url: base_url.trim_end_matches('/').to_string(),
+        })
+    }
+
+    fn with_cookie(&self, request: RequestBuilder) -> RequestBuilder {
+        request.header(
+            reqwest::header::COOKIE,
+            format!("cargo_session={}", self.cookie),
+        )
+    }
+
+    async fn send<T: DeserializeOwned>(&self, request: RequestBuilder) -> Result<T> {
+        let body = self.send_raw(request).await?;
+        serde_json::from_str(&body)
+            .with_context(|| format!("decoding crates.io response: {}", truncate(&body, 300)))
+    }
+
+    async fn send_raw(&self, request: RequestBuilder) -> Result<String> {
+        let response = self
+            .with_cookie(request)
+            .send()
+            .await
+            .context("sending request to crates.io")?;
+        let status = response.status();
+        let body = response
+            .text()
+            .await
+            .context("reading crates.io response body")?;
+        let body = redact_response(&body, &self.cookie);
+
+        if !status.is_success() {
+            return Err(ApiError {
+                status,
+                detail: error_detail(&body),
+            }
+            .into());
+        }
+
+        Ok(body)
+    }
+
+    async fn send_empty(&self, request: RequestBuilder) -> Result<()> {
+        self.send_raw(request).await.map(|_| ())
+    }
+
+    pub async fn whoami(&self) -> Result<MeResponse> {
+        self.send(self.http.get(format!("{}/api/v1/me", self.base_url)))
+            .await
+    }
+
+    pub async fn list_tokens(&self) -> Result<Vec<ApiToken>> {
+        let response: TokenList = self
+            .send(self.http.get(format!("{}/api/v1/me/tokens", self.base_url)))
+            .await?;
+        Ok(response.api_tokens)
+    }
+
+    pub async fn create_token(
+        &self,
+        name: &str,
+        endpoint_scopes: &[String],
+        crate_scopes: &[String],
+    ) -> Result<CreatedToken> {
+        let request = NewTokenRequest {
+            api_token: NewToken {
+                name,
+                endpoint_scopes: (!endpoint_scopes.is_empty()).then_some(endpoint_scopes),
+                crate_scopes: (!crate_scopes.is_empty()).then_some(crate_scopes),
+            },
+        };
+
+        let response: CreatedTokenResponse = self
+            .send(
+                self.http
+                    .put(format!("{}/api/v1/me/tokens", self.base_url))
+                    .json(&request),
+            )
+            .await?;
+
+        Ok(response.api_token)
+    }
+
+    pub async fn revoke_token(&self, id: i32) -> Result<()> {
+        self.send_empty(
+            self.http
+                .delete(format!("{}/api/v1/me/tokens/{id}", self.base_url)),
+        )
+        .await
+    }
+
+    pub async fn delete_crate(&self, name: &str, message: Option<&str>) -> Result<()> {
+        let mut request = self
+            .http
+            .delete(format!("{}/api/v1/crates/{name}", self.base_url));
+        if let Some(message) = message {
+            request = request.query(&[("message", message)]);
+        }
+        self.send_empty(request).await
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct MeResponse {
+    pub user: PrivateUser,
+    #[serde(default)]
+    pub owned_crates: Vec<OwnedCrate>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PrivateUser {
+    pub login: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub email: Option<String>,
+    #[serde(default)]
+    pub email_verified: bool,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct OwnedCrate {
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ApiToken {
+    pub id: i32,
+    pub name: String,
+    #[serde(default)]
+    pub created_at: Option<String>,
+    #[serde(default)]
+    pub last_used_at: Option<String>,
+    #[serde(default)]
+    pub crate_scopes: Option<Vec<String>>,
+    #[serde(default)]
+    pub endpoint_scopes: Option<Vec<String>>,
+    #[serde(default)]
+    pub expired_at: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct TokenList {
+    api_tokens: Vec<ApiToken>,
+}
+
+#[derive(Serialize)]
+struct NewTokenRequest<'a> {
+    api_token: NewToken<'a>,
+}
+
+#[derive(Serialize)]
+struct NewToken<'a> {
+    name: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    crate_scopes: Option<&'a [String]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    endpoint_scopes: Option<&'a [String]>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreatedToken {
+    pub id: i32,
+    pub name: String,
+    /// The plaintext token. crates.io only returns it once, at creation.
+    pub token: String,
+}
+
+#[derive(Deserialize)]
+struct CreatedTokenResponse {
+    api_token: CreatedToken,
 }
 
 fn yank_body(yanked: bool, message: Option<&str>) -> Value {
@@ -390,5 +588,29 @@ mod tests {
         assert!(!redacted.contains("abc123"));
         assert!(redacted.contains("<redacted-token>"));
         assert!(serde_json::from_str::<serde_json::Value>(&redacted).is_ok());
+    }
+
+    #[test]
+    fn session_client_requires_https() {
+        assert!(SessionClient::new("cookie", "http://127.0.0.1:8080").is_err());
+        assert!(SessionClient::new("cookie", "https://crates.io").is_ok());
+        assert!(SessionClient::new("", "https://crates.io").is_err());
+    }
+
+    #[test]
+    fn token_creation_body_uses_crates_io_field_names() {
+        let scopes = vec!["publish-update".to_string(), "yank".to_string()];
+        let request = NewTokenRequest {
+            api_token: NewToken {
+                name: "ci",
+                endpoint_scopes: Some(&scopes),
+                crate_scopes: None,
+            },
+        };
+        let value = serde_json::to_value(&request).unwrap();
+
+        assert_eq!(value["api_token"]["name"], "ci");
+        assert_eq!(value["api_token"]["endpoint_scopes"][0], "publish-update");
+        assert!(value["api_token"].get("crate_scopes").is_none());
     }
 }

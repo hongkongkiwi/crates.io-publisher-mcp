@@ -18,41 +18,72 @@ pub mod tools;
 
 use crate::DEFAULT_BASE_URL;
 use crate::USER_AGENT;
-use crate::api::WriteClient;
-use crate::auth::{Token, resolve_token};
+use crate::api::{SessionClient, WriteClient};
+use crate::auth::{Cookie, Token, resolve_cookie, resolve_token};
+use crate::credentials;
 use crate::mode::Mode;
 use crate::ops::CargoOps;
 use tools::{
-    AUTH_STATUS, CHECK_CRATE_NAME, GetCrateDependenciesTool, GetCrateDocumentationTool,
+    AUTH_STATUS, AdminTools, CHECK_CRATE_NAME, GetCrateDependenciesTool, GetCrateDocumentationTool,
     GetCrateInfoTool, GetCrateVersionsTool, PublishTools, SearchCratesTool, WriteTools,
     dependencies::CrateDependenciesInput, info::CrateNameInput, search::SearchCratesInput,
 };
 
 const RATE_LIMIT_MS: u64 = 100;
 
-/// How the server was started. Tokens are resolved once, at startup.
+/// How the server was started. Credentials are resolved once, at startup.
 #[derive(Clone)]
 pub struct ServerConfig {
     pub mode: Mode,
     pub token: Option<Token>,
+    pub cookie: Option<Cookie>,
     pub base_url: String,
 }
 
 impl ServerConfig {
     pub fn new(mode: Mode) -> Result<Self> {
         let token = if mode.allows_write() {
-            let token = resolve_token()?.ok_or_else(|| {
-                anyhow!(
-                    "`--mode {mode}` needs a crates.io API token. Set CRATES_IO_TOKEN or \
-                     CARGO_REGISTRY_TOKEN, or run `cargo login`. Create a scoped token at \
-                     https://crates.io/settings/tokens with the scopes you need: \
-                     publish-new, publish-update, yank, change-owners, trusted-publishing."
-                )
-            })?;
-            Some(token)
+            match resolve_token() {
+                Ok(token) => token,
+                // The token is optional in admin mode, so an unrelated broken
+                // credentials file must not block a cookie-only deployment.
+                Err(error) if mode == Mode::Admin => {
+                    tracing::warn!(
+                        "ignoring token resolution error in admin mode; continuing with the session cookie: {error:#}"
+                    );
+                    None
+                }
+                Err(error) => return Err(error),
+            }
         } else {
             None
         };
+
+        if mode.allows_write() && mode != Mode::Admin && token.is_none() {
+            return Err(anyhow!(
+                "`--mode {mode}` needs a crates.io API token. Run `cratesdotio-mcp login`, set \
+                 CRATES_IO_TOKEN or CARGO_REGISTRY_TOKEN, or run `cargo login`. Create a scoped \
+                 token at https://crates.io/settings/tokens with the scopes you need: \
+                 publish-new, publish-update, yank, change-owners, trusted-publishing."
+            ));
+        }
+
+        let cookie = if mode.allows_admin() {
+            Some(resolve_cookie()?.ok_or_else(|| {
+                anyhow!(
+                    "`--mode admin` needs a crates.io session cookie. Run `cratesdotio-mcp session` \
+                     to store one, or set CRATES_IO_COOKIE. The cookie is full account authority."
+                )
+            })?)
+        } else {
+            None
+        };
+
+        if mode == Mode::Admin && token.is_none() {
+            tracing::info!(
+                "admin mode has a session cookie but no API token; write and publish tools are unavailable"
+            );
+        }
 
         let base_url =
             std::env::var("CRATES_MCP_BASE_URL").unwrap_or_else(|_| DEFAULT_BASE_URL.to_string());
@@ -60,6 +91,7 @@ impl ServerConfig {
         Ok(Self {
             mode,
             token,
+            cookie,
             base_url,
         })
     }
@@ -72,6 +104,7 @@ pub struct CratesIoServer {
     mode: Mode,
     base_url: String,
     token: Option<Token>,
+    cookie: Option<Cookie>,
     search_crates: Arc<SearchCratesTool>,
     get_crate_info: Arc<GetCrateInfoTool>,
     get_crate_versions: Arc<GetCrateVersionsTool>,
@@ -79,6 +112,7 @@ pub struct CratesIoServer {
     get_crate_documentation: Arc<GetCrateDocumentationTool>,
     write: Option<Arc<WriteTools>>,
     publish: Option<Arc<PublishTools>>,
+    admin: Option<Arc<AdminTools>>,
 }
 
 impl CratesIoServer {
@@ -89,26 +123,31 @@ impl CratesIoServer {
             Duration::from_millis(RATE_LIMIT_MS),
         )?);
 
-        let write = if config.mode.allows_write() {
-            let token = config.token.clone().ok_or_else(|| {
-                anyhow!("write mode requires a token, but none was resolved at startup")
-            })?;
-            let write_client = WriteClient::new(token.expose(), &config.base_url)?;
-            Some(Arc::new(WriteTools::new(Arc::new(write_client))))
-        } else {
-            None
+        let write = match (config.mode.allows_write(), config.token.as_ref()) {
+            (true, Some(token)) => {
+                let write_client = WriteClient::new(token.expose(), &config.base_url)?;
+                Some(Arc::new(WriteTools::new(Arc::new(write_client))))
+            }
+            _ => None,
         };
 
-        let publish = if config.mode.allows_publish() {
-            let token = config.token.clone().ok_or_else(|| {
-                anyhow!("publish mode requires a token, but none was resolved at startup")
-            })?;
-            Some(Arc::new(PublishTools::new(
+        let publish = match (config.mode.allows_publish(), config.token.clone()) {
+            (true, Some(token)) => Some(Arc::new(PublishTools::new(
                 Arc::new(CargoOps::default()),
                 token,
-            )))
-        } else {
-            None
+            ))),
+            _ => None,
+        };
+
+        let admin = match (config.mode.allows_admin(), config.cookie.as_ref()) {
+            (true, Some(cookie)) => {
+                let session_client = SessionClient::new(cookie.expose(), &config.base_url)?;
+                Some(Arc::new(AdminTools::new(
+                    Arc::new(session_client),
+                    credentials::config_dir(),
+                )))
+            }
+            _ => None,
         };
 
         Ok(Self {
@@ -116,6 +155,7 @@ impl CratesIoServer {
             mode: config.mode,
             base_url: config.base_url,
             token: config.token,
+            cookie: config.cookie,
             search_crates: Arc::new(SearchCratesTool::default()),
             get_crate_info: Arc::new(GetCrateInfoTool::default()),
             get_crate_versions: Arc::new(GetCrateVersionsTool::default()),
@@ -123,6 +163,7 @@ impl CratesIoServer {
             get_crate_documentation: Arc::new(GetCrateDocumentationTool::default()),
             write,
             publish,
+            admin,
         })
     }
 
@@ -140,7 +181,7 @@ impl CratesIoServer {
             ),
             Tool::new(
                 AUTH_STATUS,
-                "Report the server mode, whether a crates.io token was found, and where it came from. The token value is never returned. crates.io has no token introspection endpoint, so scopes can only be confirmed by creating the token with the right scopes.",
+                "Report the server mode, whether a crates.io token and admin session cookie were found, and where they came from. Values are never returned. crates.io cannot map a token value to its scopes, so scopes are only confirmed by the operation that needs them.",
                 tools::schema_for::<EmptyInput>(),
             ),
         ];
@@ -150,6 +191,9 @@ impl CratesIoServer {
         }
         if let Some(publish) = &self.publish {
             tools.extend(publish.tools());
+        }
+        if let Some(admin) = &self.admin {
+            tools.extend(admin.tools());
         }
 
         tools
@@ -205,7 +249,7 @@ impl CratesIoServer {
             ))])),
             Err(crates_io_api::Error::NotFound(_)) => {
                 Ok(CallToolResult::success(vec![Content::text(format!(
-                    "`{}` is valid and not currently published. A recently deleted crate keeps its name for a cooldown period, and some names are reserved, so the registry can still reject it at publish time.",
+                    "`{}` is valid and not currently published. A recently deleted crate keeps its name for 24 hours, and some names are reserved, so the registry can still reject it at publish time.",
                     input.name
                 ))]))
             }
@@ -234,6 +278,23 @@ impl CratesIoServer {
             (None, _) => lines.push("token: missing".to_string()),
         }
 
+        if self.mode.allows_admin() {
+            match &self.cookie {
+                Some(cookie) => {
+                    lines.push("session cookie: present".to_string());
+                    lines.push(format!("cookie source: {}", cookie.source().description()));
+                    if let Some(path) = cookie.location() {
+                        lines.push(format!("session file: {}", path.display()));
+                    }
+                    lines.push(
+                        "session scope: full account authority (token creation, crate deletion, account settings)"
+                            .to_string(),
+                    );
+                }
+                None => lines.push("session cookie: missing".to_string()),
+            }
+        }
+
         lines.push(format!("api: {}", self.base_url));
         CallToolResult::success(vec![Content::text(lines.join("\n"))])
     }
@@ -257,14 +318,36 @@ impl CratesIoServer {
             Mode::Write => self
                 .write
                 .as_ref()
-                .expect("write tools exist when mode allows write")
+                .ok_or_else(|| {
+                    anyhow!(
+                        "Tool `{name}` needs an API token. Run `cratesdotio-mcp login`, or set \
+                         CRATES_IO_TOKEN."
+                    )
+                })?
                 .execute(name, args)
                 .await?
                 .ok_or_else(|| anyhow!("Unknown tool: {name}")),
             Mode::Publish => self
                 .publish
                 .as_ref()
-                .expect("publish tools exist when mode allows publish")
+                .ok_or_else(|| {
+                    anyhow!(
+                        "Tool `{name}` needs an API token. Run `cratesdotio-mcp login`, or set \
+                         CRATES_IO_TOKEN."
+                    )
+                })?
+                .execute(name, args)
+                .await?
+                .ok_or_else(|| anyhow!("Unknown tool: {name}")),
+            Mode::Admin => self
+                .admin
+                .as_ref()
+                .ok_or_else(|| {
+                    anyhow!(
+                        "Tool `{name}` needs a session cookie. Run `cratesdotio-mcp session`, or \
+                         set CRATES_IO_COOKIE."
+                    )
+                })?
                 .execute(name, args)
                 .await?
                 .ok_or_else(|| anyhow!("Unknown tool: {name}")),
@@ -288,9 +371,11 @@ impl ServerHandler for CratesIoServer {
         ServerInfo {
             instructions: Some(
                 "MCP server for crates.io, the Rust package registry. Tool availability depends \
-                 on the mode this process was started with: read-only, write, or publish. Call \
-                 crates_auth_status to see the current mode and token source. Write and publish \
-                 tools change state on crates.io and publishing is irreversible after 72 hours."
+                 on the mode this process was started with: read-only, write, publish, or admin. \
+                 Call crates_auth_status to see the current mode, token source, and whether an \
+                 admin session cookie is loaded. Write and publish tools change state on \
+                 crates.io; publishing is irreversible after 72 hours, and crate deletion is \
+                 permanent."
                     .into(),
             ),
             capabilities: ServerCapabilities::builder().enable_tools().build(),

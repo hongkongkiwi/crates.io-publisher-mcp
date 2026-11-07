@@ -293,32 +293,38 @@ pub struct WorkflowOutcome {
     pub warnings: Vec<String>,
 }
 
-#[derive(Deserialize)]
-struct ReadManifest {
-    package: ReadPackage,
+#[derive(Debug, Deserialize)]
+struct MetadataOutput {
+    packages: Vec<MetadataPackage>,
 }
 
-#[derive(Deserialize)]
-struct ReadPackage {
+#[derive(Debug, Deserialize)]
+struct MetadataPackage {
     name: String,
     version: String,
     #[serde(default)]
     description: Option<String>,
     #[serde(default)]
     license: Option<String>,
-    #[serde(default, rename = "license-file")]
+    #[serde(default)]
     license_file: Option<String>,
     #[serde(default)]
     repository: Option<String>,
     #[serde(default)]
-    publish: Option<PublishField>,
+    publish: Option<Vec<String>>,
+    manifest_path: String,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-enum PublishField {
-    Allowed(bool),
-    Registries(Vec<String>),
+/// Package metadata after cargo has resolved workspace inheritance.
+#[derive(Debug, Clone)]
+struct ResolvedPackage {
+    name: String,
+    version: String,
+    description: Option<String>,
+    license: Option<String>,
+    license_file: Option<String>,
+    repository: Option<String>,
+    publish: Option<Vec<String>>,
 }
 
 #[derive(Debug)]
@@ -328,67 +334,25 @@ struct PublishPreflight {
     warnings: Vec<String>,
 }
 
-/// Reject workspace-inherited values with a clear message instead of a serde
-/// type error. Resolving them would duplicate cargo's workspace rules.
-fn reject_workspace_inheritance(manifest: &toml::Value) -> Result<()> {
-    const INHERITABLE: [&str; 6] = [
-        "version",
-        "description",
-        "license",
-        "license-file",
-        "repository",
-        "publish",
-    ];
-
-    let Some(package) = manifest.get("package").and_then(toml::Value::as_table) else {
-        return Ok(());
-    };
-
-    for field in INHERITABLE {
-        let inherited = package
-            .get(field)
-            .and_then(toml::Value::as_table)
-            .is_some_and(|table| table.contains_key("workspace"));
-        if inherited {
-            bail!(
-                "Cargo.toml inherits `{field}` from [workspace.package]. This tool needs literal values so it can confirm the exact name and version before publishing. Run `cargo publish` directly for this crate, or copy the inherited values into the manifest."
-            );
-        }
-    }
-
-    Ok(())
-}
-
 fn publish_preflight(
-    manifest_path: &Path,
+    package: &ResolvedPackage,
     confirm: Option<&str>,
     dry_run: bool,
 ) -> Result<PublishPreflight> {
-    let text = std::fs::read_to_string(manifest_path)
-        .with_context(|| format!("reading {}", manifest_path.display()))?;
-    let raw: toml::Value =
-        toml::from_str(&text).with_context(|| format!("parsing {}", manifest_path.display()))?;
-    reject_workspace_inheritance(&raw)?;
-    let manifest: ReadManifest =
-        toml::from_str(&text).with_context(|| format!("parsing {}", manifest_path.display()))?;
-    let package = manifest.package;
-
     validate_crate_name(&package.name)?;
     validate_version(&package.version)?;
 
-    match &package.publish {
+    match package.publish.as_ref() {
         None => {}
-        Some(PublishField::Allowed(false)) => {
+        Some(registries) if registries.is_empty() => {
             bail!("Cargo.toml sets `publish = false`, so this crate cannot be published");
         }
-        Some(PublishField::Allowed(true)) => {}
-        Some(PublishField::Registries(registries)) => {
-            if !registries.iter().any(|registry| registry == "crates-io") {
-                bail!(
-                    "Cargo.toml restricts publishing to {registries:?}, which does not include `crates-io`"
-                );
-            }
+        Some(registries) if !registries.iter().any(|registry| registry == "crates-io") => {
+            bail!(
+                "Cargo.toml restricts publishing to {registries:?}, which does not include `crates-io`"
+            );
         }
+        Some(_) => {}
     }
 
     if package
@@ -423,8 +387,8 @@ fn publish_preflight(
     }
 
     Ok(PublishPreflight {
-        name: package.name,
-        version: package.version,
+        name: package.name.clone(),
+        version: package.version.clone(),
         warnings,
     })
 }
@@ -505,6 +469,7 @@ impl CargoOps {
         args: &[String],
         directory: &Path,
         token: Option<&str>,
+        redactions: &[&str],
         timeout: Duration,
     ) -> Result<CommandOutput> {
         let mut command = Command::new(&self.cargo);
@@ -515,12 +480,21 @@ impl CargoOps {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .env("CARGO_TERM_COLOR", "never")
-            .kill_on_drop(true);
+            .kill_on_drop(true)
+            // Session credentials belong to this process, not to cargo.
+            .env_remove("CRATES_IO_COOKIE")
+            .env_remove("CRATES_IO_COOKIE_FILE");
 
         if let Some(token) = token {
             command
                 .env("CARGO_REGISTRY_TOKEN", token)
                 .env("CARGO_REGISTRIES_CRATES_IO_TOKEN", token);
+        } else {
+            // Commands that do not authenticate must not inherit a token.
+            command
+                .env_remove("CRATES_IO_TOKEN")
+                .env_remove("CARGO_REGISTRY_TOKEN")
+                .env_remove("CARGO_REGISTRIES_CRATES_IO_TOKEN");
         }
 
         let output = tokio::time::timeout(timeout, command.output())
@@ -540,8 +514,8 @@ impl CargoOps {
 
         Ok(CommandOutput {
             status: output.status,
-            stdout: redact_token(&String::from_utf8_lossy(&output.stdout), token),
-            stderr: redact_token(&String::from_utf8_lossy(&output.stderr), token),
+            stdout: redact_secrets(&String::from_utf8_lossy(&output.stdout), redactions),
+            stderr: redact_secrets(&String::from_utf8_lossy(&output.stderr), redactions),
         })
     }
 
@@ -582,7 +556,13 @@ impl CargoOps {
             directory.display().to_string(),
         ];
         let output = self
-            .run(&args, &input.parent_dir, None, Duration::from_secs(120))
+            .run(
+                &args,
+                &input.parent_dir,
+                None,
+                &[],
+                Duration::from_secs(120),
+            )
             .await?;
         if !output.success() {
             bail!("cargo new failed: {}", tail(&output.stderr, 20));
@@ -603,6 +583,57 @@ impl CargoOps {
         })
     }
 
+    async fn resolve_package(
+        &self,
+        directory: &Path,
+        redaction: Option<&str>,
+    ) -> Result<ResolvedPackage> {
+        let args = vec![
+            "metadata".to_string(),
+            "--no-deps".to_string(),
+            "--format-version".to_string(),
+            "1".to_string(),
+            "--offline".to_string(),
+        ];
+        let redactions: Vec<&str> = redaction.into_iter().collect();
+        let output = self
+            .run(
+                &args,
+                directory,
+                None,
+                &redactions,
+                Duration::from_secs(120),
+            )
+            .await?;
+        if !output.success() {
+            bail!("cargo metadata failed: {}", tail(&output.stderr, 20));
+        }
+
+        let metadata: MetadataOutput =
+            serde_json::from_str(&output.stdout).context("decoding cargo metadata output")?;
+        let manifest_path = directory.join("Cargo.toml");
+        let Some(package) = metadata.packages.into_iter().find(|package| {
+            std::fs::canonicalize(&package.manifest_path)
+                .map(|path| path == manifest_path)
+                .unwrap_or(false)
+        }) else {
+            bail!(
+                "{} does not describe a package; run publish_crate inside the crate directory, not a virtual workspace root",
+                directory.display()
+            );
+        };
+
+        Ok(ResolvedPackage {
+            name: package.name,
+            version: package.version,
+            description: package.description,
+            license: package.license,
+            license_file: package.license_file,
+            repository: package.repository,
+            publish: package.publish,
+        })
+    }
+
     pub async fn publish(&self, input: &PublishInput, token: &str) -> Result<PublishOutcome> {
         if !input.directory.is_absolute() {
             bail!("directory must be an absolute path");
@@ -614,7 +645,8 @@ impl CargoOps {
             bail!("{} does not contain a Cargo.toml", directory.display());
         }
 
-        let preflight = publish_preflight(&manifest_path, input.confirm.as_deref(), input.dry_run)?;
+        let package = self.resolve_package(&directory, Some(token)).await?;
+        let preflight = publish_preflight(&package, input.confirm.as_deref(), input.dry_run)?;
 
         // Force crates.io even when the user's cargo config names a different
         // default registry. Both token env vars are set for the child process.
@@ -641,7 +673,9 @@ impl CargoOps {
         } else {
             Duration::from_secs(1200)
         };
-        let output = self.run(&args, &directory, Some(token), timeout).await?;
+        let output = self
+            .run(&args, &directory, Some(token), &[token], timeout)
+            .await?;
 
         Ok(PublishOutcome {
             success: output.success(),
@@ -700,18 +734,17 @@ impl CargoOps {
     }
 }
 
-fn redact_token(value: &str, explicit: Option<&str>) -> String {
-    // Scaffolding runs without passing a token, but the child inherits the
-    // parent environment, so scrub any token-shaped environment value too.
+fn redact_secrets(value: &str, explicit: &[&str]) -> String {
+    // Children inherit the parent environment, so scrub every credential-shaped
+    // value we know about, not just the one passed to this command.
     let env_secrets = [
         std::env::var("CRATES_IO_TOKEN").ok(),
         std::env::var("CARGO_REGISTRY_TOKEN").ok(),
         std::env::var("CARGO_REGISTRIES_CRATES_IO_TOKEN").ok(),
+        std::env::var("CRATES_IO_COOKIE").ok(),
     ];
     let mut secrets: Vec<&str> = env_secrets.iter().flatten().map(String::as_str).collect();
-    if let Some(secret) = explicit {
-        secrets.push(secret);
-    }
+    secrets.extend_from_slice(explicit);
 
     let mut redacted = value.to_string();
     for secret in secrets {
@@ -827,43 +860,65 @@ mod tests {
     #[test]
     fn redacts_the_token_from_subprocess_output() {
         assert_eq!(
-            redact_token("warning: CARGO_REGISTRY_TOKEN=secret", Some("secret")),
+            redact_secrets("warning: CARGO_REGISTRY_TOKEN=secret", &["secret"]),
             "warning: CARGO_REGISTRY_TOKEN=<redacted-token>"
         );
-        assert_eq!(redact_token("no token here", None), "no token here");
-        assert_eq!(redact_token("no token here", Some("")), "no token here");
+        assert_eq!(redact_secrets("no token here", &[]), "no token here");
+        assert_eq!(redact_secrets("no token here", &[""]), "no token here");
+    }
+
+    fn resolved_package() -> ResolvedPackage {
+        ResolvedPackage {
+            name: "example-crate".to_string(),
+            version: "0.1.0".to_string(),
+            description: Some("An example crate".to_string()),
+            license: Some("MIT".to_string()),
+            license_file: None,
+            repository: Some("https://github.com/example/example-crate".to_string()),
+            publish: None,
+        }
     }
 
     #[test]
-    fn rejects_workspace_inherited_metadata_with_a_clear_error() {
-        let dir = tempfile::tempdir().unwrap();
-        let manifest_path = dir.path().join("Cargo.toml");
-        std::fs::write(
-            &manifest_path,
-            "[package]\nname = \"example\"\nversion.workspace = true\n",
-        )
-        .unwrap();
+    fn accepts_a_publishable_package_on_a_dry_run() {
+        let preflight = publish_preflight(&resolved_package(), None, true).unwrap();
 
-        let error = publish_preflight(&manifest_path, None, true)
-            .unwrap_err()
-            .to_string();
-
-        assert!(error.contains("workspace.package"), "{error}");
-        assert!(error.contains("version"), "{error}");
+        assert_eq!(preflight.name, "example-crate");
+        assert!(preflight.warnings.is_empty());
     }
 
     #[test]
-    fn recognizes_the_hyphenated_license_file_key() {
-        let dir = tempfile::tempdir().unwrap();
-        let manifest_path = dir.path().join("Cargo.toml");
-        std::fs::write(
-            &manifest_path,
-            "[package]\nname = \"example\"\nversion = \"0.1.0\"\ndescription = \"x\"\nlicense-file = \"LICENSE\"\n",
-        )
-        .unwrap();
+    fn rejects_publish_false() {
+        let mut package = resolved_package();
+        package.publish = Some(Vec::new());
 
-        let preflight = publish_preflight(&manifest_path, None, true).unwrap();
+        assert!(publish_preflight(&package, None, true).is_err());
+    }
 
+    #[test]
+    fn rejects_a_registry_list_without_crates_io() {
+        let mut package = resolved_package();
+        package.publish = Some(vec!["private".to_string()]);
+
+        assert!(publish_preflight(&package, None, true).is_err());
+    }
+
+    #[test]
+    fn requires_an_exact_confirm_for_a_real_publish() {
+        let package = resolved_package();
+
+        assert!(publish_preflight(&package, None, false).is_err());
+        assert!(publish_preflight(&package, Some("example-crate@9.9.9"), false).is_err());
+        assert!(publish_preflight(&package, Some("example-crate@0.1.0"), false).is_ok());
+    }
+
+    #[test]
+    fn recognizes_license_file_instead_of_license() {
+        let mut package = resolved_package();
+        package.license = None;
+        package.license_file = Some("LICENSE".to_string());
+
+        let preflight = publish_preflight(&package, None, true).unwrap();
         assert!(
             !preflight
                 .warnings

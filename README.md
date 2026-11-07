@@ -1,18 +1,19 @@
 # cratesdotio-mcp
 
-MCP server for [crates.io](https://crates.io). It reads crate data by default. With an explicit mode it can also scaffold a crate, publish it, yank versions, manage owners, and set up trusted publishing for GitHub Actions.
+MCP server for [crates.io](https://crates.io). It reads crate data by default. With an explicit mode it can also scaffold a crate, publish it, yank versions, manage owners, set up trusted publishing for GitHub Actions, and, with a session cookie, manage account-level operations such as API tokens and crate deletion.
 
 ## Modes
 
 The server refuses to start without `--mode` or `CRATES_MCP_MODE`. There is no default, so a server that can publish cannot start by accident.
 
-| Mode | What it adds | Token |
+| Mode | What it adds | Credential |
 | --- | --- | --- |
-| `read-only` | Search, crate info, versions, dependencies, docs, name availability | Not read |
-| `write` | Owner management, yank and unyank, trusted publishing configuration | Required |
-| `publish` | Local scaffolding, workflow generation, `cargo publish` | Required |
+| `read-only` | Search, crate info, versions, dependencies, docs, name availability | None |
+| `write` | Owner management, yank and unyank, trusted publishing configuration | API token |
+| `publish` | Local scaffolding, workflow generation, `cargo publish` | API token |
+| `admin` | Whoami, token listing, creation and revocation, crate deletion | Session cookie, plus a token for write and publish tools |
 
-Write and publish tools are not listed in a lower mode. Calling one anyway returns an error that names the required mode.
+Write, publish, and admin tools are not listed in a lower mode. Calling one anyway returns an error that names the required mode.
 
 ## Tools
 
@@ -26,7 +27,7 @@ Read-only, available in every mode:
 | `get_crate_dependencies` | Dependencies of a version |
 | `get_crate_documentation` | docs.rs links |
 | `check_crate_name` | Validate syntax and check whether the name is taken |
-| `crates_auth_status` | Report mode, token presence, and token source. Never prints the token |
+| `crates_auth_status` | Report mode, token and cookie presence, and their sources. Never prints values |
 
 `write` mode:
 
@@ -50,6 +51,16 @@ Read-only, available in every mode:
 | `publish_crate` | `cargo publish`, with a dry run by default |
 | `generate_publish_workflow` | Write `.github/workflows/<name>.yml` using trusted publishing |
 
+`admin` mode, on top of everything above when a token is also present:
+
+| Tool | Purpose |
+| --- | --- |
+| `crates_whoami` | Account login, email verification state, owned crates |
+| `list_api_tokens` | Active tokens with scopes, creation and last-used times |
+| `create_api_token` | Create a scoped token. Stores it by default instead of returning it |
+| `revoke_api_token` | Revoke a token by id, confirmed with `revoke <id>` |
+| `delete_crate` | Permanently delete a crate, confirmed with `delete <name>` |
+
 ## Authentication
 
 Create a token at <https://crates.io/settings/tokens> with only the scopes you need:
@@ -66,24 +77,50 @@ The server reads the token from the first source that provides one:
 
 1. `CRATES_IO_TOKEN`
 2. `CARGO_REGISTRY_TOKEN`
-3. `$CARGO_HOME/credentials.toml`, `registries.crates-io.token` or the legacy `registry.token`
+3. `$CRATES_MCP_CONFIG_DIR/token`, written by `cratesdotio-mcp login` or `mint-token`
+4. `$CARGO_HOME/credentials.toml`, `registries.crates-io.token` or the legacy `registry.token`
 
 A token is never accepted as a tool argument, because tool arguments end up in model context and transcripts. The value is redacted from debug output and never logged.
 
-### What the server cannot do
+The command line stores credentials for you:
 
-These are crates.io limits, not missing features:
+```bash
+# Paste a token once, with hidden input
+cratesdotio-mcp login
 
-- **Create an API token.** `PUT /api/v1/me/tokens` is session-cookie only and returns `400 cannot use an API token to create a new API token` when called with a token. There is no supported way for a tool holding a token to mint another token.
-- **Log in as you.** Session login needs the web UI, and the session cookie gives full account access. This server never asks for or stores cookies.
-- **Verify token scopes.** crates.io has no token introspection endpoint (`/api/v1/me` is cookie-only). A missing scope appears as HTTP 403 on the first operation that needs it.
-- **Delete a crate.** `DELETE /api/v1/crates/{name}` is cookie-only and also limited by crate age, downloads, and reverse dependencies.
+# Or create a scoped token from a stored session cookie
+cratesdotio-mcp mint-token --name laptop-mcp --scopes publish-update,yank
 
-Create the token in the browser once, then give it to the server through the environment.
+# Show which credentials exist, without printing values
+cratesdotio-mcp status
 
-## Cargo-side limits
+# Remove stored credentials
+cratesdotio-mcp logout
+```
 
-- Crates that inherit `version`, `description`, `license`, `license-file`, `repository`, or `publish` from `[workspace.package]` are rejected before publishing, because the confirm string needs literal values. Run `cargo publish` directly for those crates.
+`mint-token` stores the new token at `$CRATES_MCP_CONFIG_DIR/token` and does not print it unless `--reveal` is passed. Use `--reveal` when you need the value for a CI secret.
+
+### Session cookie for admin mode
+
+`admin` mode needs the `cargo_session` cookie:
+
+```bash
+cratesdotio-mcp session
+```
+
+The command opens the token page, explains where to find the cookie in browser devtools, reads the value with hidden input, verifies it with a whoami request, and stores it at `$CRATES_MCP_CONFIG_DIR/session` with mode 0600.
+
+The cookie grants full account authority: token creation, crate deletion, email and account settings. It is only loaded in `admin` mode, never accepted as a tool argument, redacted from output, and never sent over plaintext HTTP. `admin` mode refuses a non-loopback HTTP bind. The tool never handles your GitHub password and never automates the GitHub login or 2FA.
+
+### What is still impossible
+
+- **Automating the GitHub login.** crates.io signs in through GitHub OAuth. A scripted login would need your GitHub password and 2FA, and the resulting session would be the same full-authority credential the cookie already is. Import a real browser session instead.
+- **Mapping a token value to its scopes.** crates.io returns a token value only once, at creation, and never exposes it again. `list_api_tokens` shows every token's scopes, but cannot tell you which entry belongs to the value in `CRATES_IO_TOKEN`. A missing scope still shows up as HTTP 403 on the first operation.
+- **Creating a crate without publishing.** There is no create-crate endpoint. A crate exists after its first version is uploaded, so trusted publishing can only be configured after that first publish.
+
+## Cargo-side notes
+
+- Workspace-inherited package fields are resolved through `cargo metadata`, so members that use `[workspace.package]` publish normally.
 - The publish tool always targets the `crates-io` registry, even when the user's cargo config names a different default registry.
 
 ## Flows
@@ -134,6 +171,21 @@ publish_crate { directory, dry_run: false, confirm: "name@version" }
 
 Yank and unyank are reversible and need no confirmation. Owner changes may create invitations that the invitee must accept. `set_trustpub_only` rejects publishes from long-lived tokens but does not revoke tokens that already exist.
 
+### Account operations and deletion
+
+In `admin` mode, with a stored session cookie:
+
+```
+crates_whoami
+list_api_tokens
+create_api_token { name: "laptop-mcp", endpoint_scopes: ["publish-update", "yank"] }
+delete_crate { name: "old-crate", confirm: "delete old-crate" }
+```
+
+`create_api_token` writes the new value to the token file and reports only the id and path, so the secret stays out of the transcript. Set `reveal: true` only when you need the value in the conversation. The running server keeps the token it loaded at startup, so restart it after creating a new one.
+
+`delete_crate` is permanent. crates.io only allows it within 72 hours of creation, or for a single-owner crate with under 1000 downloads per month, no reverse dependencies, and no team owners. The name stays reserved for 24 hours.
+
 ## Running
 
 ```bash
@@ -144,6 +196,9 @@ cargo build --release
 
 # stdio, publish
 CRATES_IO_TOKEN=... ./target/release/cratesdotio-mcp --mode publish
+
+# stdio, admin (session cookie, token optional)
+cratesdotio-mcp --mode admin
 
 # HTTP, read-only, port 3000
 ./target/release/cratesdotio-mcp --mode read-only --http
@@ -156,7 +211,10 @@ Environment variables:
 | `CRATES_MCP_MODE` | Same as `--mode` |
 | `CRATES_IO_TOKEN` | Token, highest precedence |
 | `CARGO_REGISTRY_TOKEN` | Token, second precedence |
-| `CRATES_MCP_BASE_URL` | Base URL for write API calls, default `https://crates.io`. The read client always uses crates.io. It must use https, except for loopback test servers. The token is sent to this host |
+| `CRATES_IO_COOKIE` | `cargo_session` cookie value for admin mode, highest precedence |
+| `CRATES_IO_COOKIE_FILE` | File containing the `cargo_session` value |
+| `CRATES_MCP_CONFIG_DIR` | Credential directory, default `$XDG_CONFIG_HOME/cratesdotio-mcp` or `~/.config/cratesdotio-mcp` |
+| `CRATES_MCP_BASE_URL` | Base URL for authenticated API calls, default `https://crates.io`. The read client always uses crates.io. Token calls allow loopback http for tests; the session-cookie client always requires https. Credentials are sent to this host |
 | `CARGO` | Path to the cargo binary, used for scaffolding and publishing |
 
 ### MCP configuration
@@ -196,14 +254,15 @@ docker build -t cratesdotio-mcp .
 docker run -d -p 8080:8080 cratesdotio-mcp --http 8080
 ```
 
-Publishing needs the crate on the same filesystem as the server and a local cargo, so write and publish modes are stdio-only. A write-mode server refuses to bind to a non-loopback address over HTTP.
+Publishing needs the crate on the same filesystem as the server and a local cargo, so publish and admin modes are stdio-only. A server in any mode other than read-only refuses to bind to a non-loopback address over HTTP.
 
 ## Security notes
 
 - `cargo publish` runs the crate's build scripts and proc macros. Publish mode is local code execution. Do not point it at untrusted crates.
-- Write and publish modes hold a real credential. They refuse to start without a token, and they refuse a non-loopback HTTP bind.
-- Publishing is permanent after 72 hours. The `confirm` argument exists to stop accidental publishes, including from an agent that guessed the next version.
-- Tokens are read once at startup and passed to cargo through the environment, not through the command line. Cargo output is scrubbed of the token before it is returned, including on build failures.
+- Write, publish, and admin modes hold real credentials. A token is required for write and publish; a session cookie is required for admin. Every mode above read-only refuses a non-loopback HTTP bind.
+- `admin` mode holds a session cookie with full account authority. It is stored with mode 0600, loaded only in admin mode, and never returned to the model. Prefer a scoped token for anything that does not need account operations.
+- Publishing is permanent after 72 hours. The `confirm` argument exists to stop accidental publishes, including from an agent that guessed the next version. Crate deletion is permanent and requires `confirm` to name the crate.
+- Credentials are read once at startup and passed to cargo through the environment, not through the command line. Cargo output and API responses are scrubbed of credentials before they are returned, including on build failures.
 
 ## Development
 
@@ -213,4 +272,4 @@ cargo clippy --all-targets -- -D warnings
 cargo fmt --all
 ```
 
-The unit tests cover token precedence and redaction, mode gating, crate name and version validation, manifest rendering, publish preflight rules, and workflow rendering. They do not contact crates.io.
+The unit and integration tests cover token and cookie precedence and redaction, mode gating, crate name and version validation, manifest rendering, publish preflight rules, workflow rendering, and the CLI gates. They do not contact crates.io.

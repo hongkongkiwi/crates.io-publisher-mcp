@@ -1,10 +1,12 @@
 pub mod api;
 pub mod auth;
+pub mod credentials;
 pub mod mode;
 pub mod ops;
+pub mod scopes;
 pub mod server;
 
-pub use auth::{Token, TokenSource, resolve_token};
+pub use auth::{Cookie, CookieSource, Token, TokenSource, resolve_cookie, resolve_token};
 pub use mode::Mode;
 pub use server::{CratesIoServer, ServerConfig};
 
