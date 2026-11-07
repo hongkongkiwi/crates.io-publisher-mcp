@@ -197,12 +197,23 @@ pub struct SessionClient {
 
 impl SessionClient {
     pub fn new(cookie: &str, base_url: &str) -> Result<Self> {
+        Self::build(cookie, base_url, true)
+    }
+
+    /// Loopback http is allowed here only so contract tests can use a mock
+    /// server. Production paths always use [`SessionClient::new`].
+    #[doc(hidden)]
+    pub fn new_for_tests(cookie: &str, base_url: &str) -> Result<Self> {
+        Self::build(cookie, base_url, false)
+    }
+
+    fn build(cookie: &str, base_url: &str, require_https: bool) -> Result<Self> {
         if cookie.trim().is_empty() {
             anyhow::bail!("crates.io session cookie is empty");
         }
         // The cookie is full account authority. Do not allow the loopback
         // plaintext exception that the scoped-token client uses for tests.
-        if !base_url.starts_with("https://") {
+        if require_https && !base_url.starts_with("https://") {
             anyhow::bail!("the crates.io session cookie is only sent over https; got `{base_url}`");
         }
         validate_base_url(base_url)?;
@@ -474,6 +485,36 @@ fn error_detail(body: &str) -> String {
     } else {
         truncate(body, 500)
     }
+}
+
+/// Turn a write-API error into a message that names the scope the operation
+/// needs, so an agent can repair the credential instead of retrying blindly.
+pub fn describe_api_error(error: &anyhow::Error, scope: &str) -> String {
+    if let Some(api) = error.downcast_ref::<ApiError>() {
+        if api.status == StatusCode::FORBIDDEN {
+            return format!(
+                "{api}. This usually means the token is missing the `{scope}` scope, or it was revoked or expired. Run `crates_auth_status` for the token source, or `list_api_tokens` in admin mode to see recorded scopes."
+            );
+        }
+        if api.status == StatusCode::UNAUTHORIZED {
+            return format!(
+                "{api}. The token was rejected; it may be revoked, expired, or mistyped."
+            );
+        }
+    }
+    format!("{error:#}")
+}
+
+/// Session-cookie errors point at the cookie rather than a token scope.
+pub fn describe_session_error(error: &anyhow::Error) -> String {
+    if let Some(api) = error.downcast_ref::<ApiError>()
+        && matches!(api.status, StatusCode::FORBIDDEN | StatusCode::UNAUTHORIZED)
+    {
+        return format!(
+            "{api}. The session cookie was rejected or has expired. Run `cratesdotio-mcp session` again."
+        );
+    }
+    format!("{error:#}")
 }
 
 fn redact_response(body: &str, token: &str) -> String {

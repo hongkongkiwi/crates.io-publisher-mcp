@@ -126,7 +126,10 @@ impl CratesIoServer {
         let write = match (config.mode.allows_write(), config.token.as_ref()) {
             (true, Some(token)) => {
                 let write_client = WriteClient::new(token.expose(), &config.base_url)?;
-                Some(Arc::new(WriteTools::new(Arc::new(write_client))))
+                Some(Arc::new(WriteTools::new(
+                    Arc::new(write_client),
+                    config.mode,
+                )))
             }
             _ => None,
         };
@@ -135,6 +138,7 @@ impl CratesIoServer {
             (true, Some(token)) => Some(Arc::new(PublishTools::new(
                 Arc::new(CargoOps::default()),
                 token,
+                config.mode,
             ))),
             _ => None,
         };
@@ -270,9 +274,28 @@ impl CratesIoServer {
                     lines.push(format!("credentials file: {}", path.display()));
                 }
                 lines.push(
-                    "scopes: cannot be queried. crates.io has no token introspection endpoint, so a missing scope appears as HTTP 403 on the first write. Confirm scopes when creating the token at https://crates.io/settings/tokens."
+                    "scopes: crates.io has no token introspection endpoint, so a missing scope appears as HTTP 403 on the first write."
                         .to_string(),
                 );
+                match credentials::read_token_meta(&credentials::config_dir()) {
+                    Ok(Some(meta)) if meta.matches_token(token.expose()) => lines.push(format!(
+                        "recorded scopes: {} (token #{} {}, recorded when this tool created it)",
+                        meta.scope_summary(),
+                        meta.id,
+                        meta.name
+                    )),
+                    Ok(Some(_)) => lines.push(
+                        "recorded scopes: unknown (the metadata belongs to a different token)"
+                            .to_string(),
+                    ),
+                    Ok(None) => lines.push(
+                        "recorded scopes: unknown (this token was not created by this tool)"
+                            .to_string(),
+                    ),
+                    Err(error) => {
+                        lines.push(format!("recorded scopes: unreadable ({error})"));
+                    }
+                }
             }
             (None, Mode::ReadOnly) => lines.push("token: not read (read-only mode)".to_string()),
             (None, _) => lines.push("token: missing".to_string()),

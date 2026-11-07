@@ -1,5 +1,7 @@
 use super::schema_for;
+use crate::audit;
 use crate::auth::Token;
+use crate::credentials;
 use crate::ops::{
     CargoOps, PublishInput, PublishOutcome, ScaffoldInput, ScaffoldOutcome, WorkflowInput,
     WorkflowOutcome,
@@ -13,10 +15,13 @@ use serde_json::{Map, Value};
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::mode::Mode;
+
 /// Tools that create a crate locally, publish it, or write CI workflows.
 pub struct PublishTools {
     ops: Arc<CargoOps>,
     token: Token,
+    mode: Mode,
 }
 
 impl PublishTools {
@@ -24,8 +29,8 @@ impl PublishTools {
     pub const PUBLISH: &'static str = "publish_crate";
     pub const WORKFLOW: &'static str = "generate_publish_workflow";
 
-    pub fn new(ops: Arc<CargoOps>, token: Token) -> Self {
-        Self { ops, token }
+    pub fn new(ops: Arc<CargoOps>, token: Token, mode: Mode) -> Self {
+        Self { ops, token, mode }
     }
 
     pub fn tools(&self) -> Vec<Tool> {
@@ -91,10 +96,39 @@ impl PublishTools {
             no_verify: input.no_verify,
         };
 
-        match self.ops.publish(&publish, self.token.expose()).await {
+        let result = self.ops.publish(&publish, self.token.expose()).await;
+        match &result {
+            Ok(outcome) => {
+                let detail = outcome.exit_code.map(|code| code.to_string());
+                audit::record_or_warn(
+                    &credentials::config_dir(),
+                    self.mode.as_str(),
+                    if outcome.dry_run {
+                        "publish-dry-run"
+                    } else {
+                        "publish"
+                    },
+                    &format!("{}@{}", outcome.name, outcome.version),
+                    if outcome.success { "ok" } else { "error" },
+                    detail.as_deref(),
+                );
+            }
+            Err(_) => {
+                audit_publish_error(&credentials::config_dir(), self.mode, publish.dry_run);
+            }
+        }
+
+        match result {
             Ok(outcome) if outcome.success => Ok(success_result(format_publish(&outcome))),
             Ok(outcome) => Ok(error_result(format_publish(&outcome))),
-            Err(error) => Ok(error_result(format!("Publish failed: {error}"))),
+            Err(error) => {
+                let mut message = error.to_string();
+                if let Some(confirm) = publish.confirm.as_deref().filter(|value| !value.is_empty())
+                {
+                    message = message.replace(confirm, "[redacted]");
+                }
+                Ok(error_result(format!("Publish failed: {message}")))
+            }
         }
     }
 
@@ -107,6 +141,7 @@ impl PublishTools {
             environment: input.environment,
             run_tests: input.run_tests,
             locked: input.locked,
+            pin_actions: input.pin_actions,
             overwrite: input.overwrite,
         };
 
@@ -128,6 +163,21 @@ fn success_result(text: String) -> CallToolResult {
 
 fn error_result(text: String) -> CallToolResult {
     CallToolResult::error(vec![Content::text(text)])
+}
+
+fn audit_publish_error(config_dir: &std::path::Path, mode: Mode, dry_run: bool) {
+    audit::record_or_warn(
+        config_dir,
+        mode.as_str(),
+        if dry_run {
+            "publish-dry-run"
+        } else {
+            "publish"
+        },
+        "unknown",
+        "error",
+        Some("publish-failed"),
+    );
 }
 
 fn format_scaffold(outcome: &ScaffoldOutcome) -> String {
@@ -267,6 +317,56 @@ pub struct PublishCrateInput {
     pub no_verify: bool,
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auth::TokenSource;
+
+    #[tokio::test]
+    async fn publish_error_audit_excludes_request_values() {
+        if let Some(dir) = std::env::var_os("PUBLISH_AUDIT_TEST_DIR") {
+            let secret = "secret-request-value";
+            let tools = PublishTools::new(
+                Arc::new(CargoOps::default()),
+                Token::new("token".into(), TokenSource::CratesIoTokenEnv, None),
+                Mode::Publish,
+            );
+            tools
+                .publish(PublishCrateInput {
+                    directory: PathBuf::from(&dir)
+                        .join(secret)
+                        .to_string_lossy()
+                        .into_owned(),
+                    dry_run: false,
+                    confirm: Some(secret.into()),
+                    allow_dirty: false,
+                    no_verify: false,
+                })
+                .await
+                .unwrap();
+            let log = std::fs::read_to_string(credentials::audit_path(std::path::Path::new(&dir)))
+                .unwrap();
+            assert!(!log.contains(secret));
+            let record: Value = serde_json::from_str(log.trim()).unwrap();
+            assert_eq!(record["target"], "unknown");
+            assert_eq!(record["detail"], "publish-failed");
+            assert_eq!(record["result"], "error");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "server::tools::publish::tests::publish_error_audit_excludes_request_values",
+            ])
+            .env("PUBLISH_AUDIT_TEST_DIR", dir.path())
+            .env("CRATES_MCP_CONFIG_DIR", dir.path())
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct GenerateWorkflowInput {
     /// Absolute path to the crate directory (the directory containing Cargo.toml)
@@ -287,6 +387,9 @@ pub struct GenerateWorkflowInput {
     /// Pass `--locked` to cargo. Commit Cargo.lock first
     #[serde(default)]
     pub locked: bool,
+    /// Pin actions to commit SHAs instead of moving tags or branches
+    #[serde(default = "default_true")]
+    pub pin_actions: bool,
     /// Replace an existing workflow file
     #[serde(default)]
     pub overwrite: bool,

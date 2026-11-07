@@ -29,7 +29,6 @@ USER mcp
 # Expose HTTP port (for --http mode)
 EXPOSE 3000
 
-# Runs read-only over HTTP. Write and publish modes are stdio-only because they
-# need the crate on the same filesystem as cargo, and a write-capable server
-# refuses a non-loopback HTTP bind.
+# Runs read-only over HTTP. Write and publish modes refuse a non-loopback HTTP
+# bind; real publishes use stdio so the crate and cargo share a filesystem.
 ENTRYPOINT ["cratesdotio-mcp", "--mode", "read-only"]

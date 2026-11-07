@@ -246,9 +246,9 @@ fn admin_mode_ignores_a_broken_cargo_credentials_file() {
 }
 
 #[test]
-fn admin_mode_refuses_a_non_loopback_http_bind() {
+fn admin_mode_refuses_http() {
     let output = Command::new(BIN)
-        .args(["--mode", "admin", "--http", "0", "--bind", "0.0.0.0"])
+        .args(["--mode", "admin", "--http", "0", "--bind", "127.0.0.1"])
         .env("CRATES_IO_COOKIE", "fake-cookie")
         .env("CRATES_MCP_CONFIG_DIR", test_dir("crates-mcp-test-config"))
         .output()
@@ -256,7 +256,7 @@ fn admin_mode_refuses_a_non_loopback_http_bind() {
 
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("must bind to loopback"), "{stderr}");
+    assert!(stderr.contains("stdio-only"), "{stderr}");
 }
 
 #[test]

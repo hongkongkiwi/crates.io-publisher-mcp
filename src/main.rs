@@ -1,10 +1,11 @@
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand};
-use cratesdotio_mcp::api::SessionClient;
-use cratesdotio_mcp::auth;
-use cratesdotio_mcp::credentials;
-use cratesdotio_mcp::scopes::{validate_crate_scopes, validate_endpoint_scopes};
-use cratesdotio_mcp::{CratesIoServer, DEFAULT_BASE_URL, Mode, ServerConfig};
+use crates_io_publisher_mcp::api::SessionClient;
+use crates_io_publisher_mcp::audit;
+use crates_io_publisher_mcp::auth;
+use crates_io_publisher_mcp::credentials;
+use crates_io_publisher_mcp::scopes::{validate_crate_scopes, validate_endpoint_scopes};
+use crates_io_publisher_mcp::{CratesIoServer, DEFAULT_BASE_URL, Mode, ServerConfig};
 use rmcp::ServiceExt;
 use rmcp::transport::stdio;
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
@@ -91,6 +92,14 @@ async fn main() -> Result<()> {
     let mode = cli
         .mode
         .ok_or_else(|| anyhow!("--mode is required when no subcommand is given"))?;
+
+    if mode == Mode::Admin && cli.http.is_some() {
+        bail!(
+            "`--mode admin` is stdio-only. The HTTP transport has no authentication, and the \
+             session cookie grants full account authority."
+        );
+    }
+
     let config = ServerConfig::new(mode)?;
 
     if let Some(port) = cli.http {
@@ -165,6 +174,8 @@ fn store_token() -> Result<()> {
     let token = prompt_secret("API token: ")?;
     let path = credentials::token_path();
     credentials::write_secret(&path, &token)?;
+    // The new token has no recorded scopes, so drop metadata from an older one.
+    let _ = credentials::remove_token_meta(&credentials::config_dir());
     println!("Stored token at {} (mode 0600).", path.display());
     Ok(())
 }
@@ -214,8 +225,29 @@ async fn mint_token(
         std::env::var("CRATES_MCP_BASE_URL").unwrap_or_else(|_| DEFAULT_BASE_URL.to_string());
     let client = SessionClient::new(cookie.expose(), &base_url)?;
 
-    let created = client.create_token(&name, &scopes, &crate_scopes).await?;
+    let created = match client.create_token(&name, &scopes, &crate_scopes).await {
+        Ok(created) => created,
+        Err(error) => {
+            audit::record_or_warn(
+                &credentials::config_dir(),
+                "cli",
+                "create-api-token",
+                &name,
+                "error",
+                Some("api error"),
+            );
+            return Err(error.context("creating the token"));
+        }
+    };
     println!("Created token #{} ({}).", created.id, created.name);
+    audit::record_or_warn(
+        &credentials::config_dir(),
+        "cli",
+        "create-api-token",
+        &created.name,
+        "ok",
+        None,
+    );
 
     if !no_store {
         let path = credentials::token_path();
@@ -227,6 +259,17 @@ async fn mint_token(
                 "token #{} was created but could not be stored: {error}. It remains active; revoke it if you cannot recover the value.",
                 created.id
             );
+        }
+        let meta = credentials::TokenMeta::for_token(
+            &created.token,
+            created.id,
+            created.name.clone(),
+            scopes.clone(),
+            crate_scopes.clone(),
+            chrono::Utc::now().to_rfc3339(),
+        );
+        if let Err(error) = credentials::write_token_meta(&credentials::config_dir(), &meta) {
+            eprintln!("warning: could not record the token scopes: {error}");
         }
         println!(
             "Stored at {} (mode 0600). Any previous stored token was replaced.",
@@ -249,6 +292,21 @@ fn print_status() -> Result<()> {
             println!("token: present ({})", token.source().description());
             if let Some(path) = token.location() {
                 println!("  location: {}", path.display());
+            }
+            match credentials::read_token_meta(&credentials::config_dir()) {
+                Ok(Some(meta)) if meta.matches_token(token.expose()) => println!(
+                    "  recorded scopes: {} (token #{} {})",
+                    meta.scope_summary(),
+                    meta.id,
+                    meta.name
+                ),
+                Ok(Some(_)) => {
+                    println!("  recorded scopes: unknown (metadata belongs to a different token)")
+                }
+                Ok(None) => {
+                    println!("  recorded scopes: unknown (token was not created by this tool)")
+                }
+                Err(error) => println!("  recorded scopes: unreadable ({error})"),
             }
         }
         None => println!("token: none"),
@@ -286,6 +344,7 @@ fn logout(token_only: bool, session_only: bool) -> Result<()> {
         } else {
             println!("No stored token at {}", path.display());
         }
+        let _ = credentials::remove_token_meta(&credentials::config_dir());
     }
 
     if remove_session {

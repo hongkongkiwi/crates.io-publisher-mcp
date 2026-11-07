@@ -1,5 +1,6 @@
 use super::schema_for;
-use crate::api::{ApiToken, SessionClient};
+use crate::api::{ApiToken, SessionClient, describe_session_error};
+use crate::audit;
 use crate::credentials;
 use crate::ops::validate_crate_name;
 use crate::scopes::{validate_crate_scopes, validate_endpoint_scopes};
@@ -79,14 +80,20 @@ impl AdminTools {
     async fn whoami(&self) -> Result<CallToolResult> {
         match self.client.whoami().await {
             Ok(me) => Ok(success_result(format_whoami(&me))),
-            Err(error) => Ok(error_result(format!("Failed to read the account: {error}"))),
+            Err(error) => Ok(error_result(format!(
+                "Failed to read the account: {}",
+                describe_session_error(&error)
+            ))),
         }
     }
 
     async fn list_tokens(&self) -> Result<CallToolResult> {
         match self.client.list_tokens().await {
             Ok(tokens) => Ok(success_result(format_tokens(&tokens))),
-            Err(error) => Ok(error_result(format!("Failed to list tokens: {error}"))),
+            Err(error) => Ok(error_result(format!(
+                "Failed to list tokens: {}",
+                describe_session_error(&error)
+            ))),
         }
     }
 
@@ -113,9 +120,14 @@ impl AdminTools {
         {
             Ok(created) => created,
             Err(error) => {
-                return Ok(error_result(format!("Failed to create token: {error}")));
+                self.audited("create-api-token", &input.name, false);
+                return Ok(error_result(format!(
+                    "Failed to create token: {}",
+                    describe_session_error(&error)
+                )));
             }
         };
+        self.audited("create-api-token", &input.name, true);
 
         let mut message = format!(
             "Created API token #{} ({}) with scopes: {}.",
@@ -139,6 +151,19 @@ impl AdminTools {
                     );
                 }
                 return Ok(error_result(failure));
+            }
+            let meta = credentials::TokenMeta::for_token(
+                &created.token,
+                created.id,
+                created.name.clone(),
+                input.endpoint_scopes.clone(),
+                input.crate_scopes.clone(),
+                chrono::Utc::now().to_rfc3339(),
+            );
+            if let Err(error) = credentials::write_token_meta(&self.config_dir, &meta) {
+                message.push_str(&format!(
+                    "\nwarning: could not record the token scopes: {error}"
+                ));
             }
             message.push_str(&format!(
                 "\nStored at {} with owner-only permissions. Any previous stored token was replaced. The running server keeps the token it loaded at startup, so restart it to use the new one.",
@@ -166,12 +191,22 @@ impl AdminTools {
             )));
         }
 
-        match self.client.revoke_token(input.config_id).await {
+        let result = self.client.revoke_token(input.config_id).await;
+        self.audited(
+            "revoke-api-token",
+            &input.config_id.to_string(),
+            result.is_ok(),
+        );
+
+        match result {
             Ok(()) => Ok(success_result(format!(
                 "Revoked API token #{}.",
                 input.config_id
             ))),
-            Err(error) => Ok(error_result(format!("Failed to revoke token: {error}"))),
+            Err(error) => Ok(error_result(format!(
+                "Failed to revoke token: {}",
+                describe_session_error(&error)
+            ))),
         }
     }
 
@@ -187,17 +222,33 @@ impl AdminTools {
             )));
         }
 
-        match self
+        let result = self
             .client
             .delete_crate(&input.name, input.message.as_deref())
-            .await
-        {
+            .await;
+        self.audited("delete-crate", &input.name, result.is_ok());
+
+        match result {
             Ok(()) => Ok(success_result(format!(
                 "Deleted crate `{}`. crates.io reserves the name for 24 hours, and the crate cannot be restored.",
                 input.name
             ))),
-            Err(error) => Ok(error_result(format!("Failed to delete crate: {error}"))),
+            Err(error) => Ok(error_result(format!(
+                "Failed to delete crate: {}",
+                describe_session_error(&error)
+            ))),
         }
+    }
+
+    fn audited(&self, action: &str, target: &str, ok: bool) {
+        audit::record_or_warn(
+            &self.config_dir,
+            "admin",
+            action,
+            target,
+            if ok { "ok" } else { "error" },
+            None,
+        );
     }
 }
 

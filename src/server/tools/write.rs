@@ -1,6 +1,8 @@
 use super::info::CrateNameInput;
 use super::schema_for;
-use crate::api::{GithubConfig, NewGithubConfig, Owner, WriteClient};
+use crate::api::{GithubConfig, NewGithubConfig, Owner, WriteClient, describe_api_error};
+use crate::audit;
+use crate::credentials;
 use crate::ops::{
     validate_crate_name, validate_environment, validate_github_name, validate_version,
     validate_workflow_filename,
@@ -13,9 +15,12 @@ use serde::de::DeserializeOwned;
 use serde_json::{Map, Value};
 use std::sync::Arc;
 
+use crate::mode::Mode;
+
 /// Tools that change crates.io state through the authenticated API.
 pub struct WriteTools {
     client: Arc<WriteClient>,
+    mode: Mode,
 }
 
 impl WriteTools {
@@ -29,8 +34,8 @@ impl WriteTools {
     pub const DELETE_TRUSTPUB: &'static str = "delete_trustpub_github_config";
     pub const SET_TRUSTPUB_ONLY: &'static str = "set_trustpub_only";
 
-    pub fn new(client: Arc<WriteClient>) -> Self {
-        Self { client }
+    pub fn new(client: Arc<WriteClient>, mode: Mode) -> Self {
+        Self { client, mode }
     }
 
     pub fn tools(&self) -> Vec<Tool> {
@@ -120,13 +125,22 @@ impl WriteTools {
             return Ok(error_result(format!("Invalid crate name: {error}")));
         }
 
-        match self
+        let result = self
             .client
             .add_owners(&input.name, std::slice::from_ref(&input.owner))
-            .await
-        {
+            .await;
+        self.audited(
+            "add-owner",
+            &format!("{}:{}", input.name, input.owner),
+            result.is_ok(),
+        );
+
+        match result {
             Ok(message) => Ok(success_result(message)),
-            Err(error) => Ok(error_result(format!("Failed to add owner: {error}"))),
+            Err(error) => Ok(error_result(format!(
+                "Failed to add owner: {}",
+                describe_api_error(&error, "change-owners")
+            ))),
         }
     }
 
@@ -135,13 +149,22 @@ impl WriteTools {
             return Ok(error_result(format!("Invalid crate name: {error}")));
         }
 
-        match self
+        let result = self
             .client
             .remove_owners(&input.name, std::slice::from_ref(&input.owner))
-            .await
-        {
+            .await;
+        self.audited(
+            "remove-owner",
+            &format!("{}:{}", input.name, input.owner),
+            result.is_ok(),
+        );
+
+        match result {
             Ok(message) => Ok(success_result(message)),
-            Err(error) => Ok(error_result(format!("Failed to remove owner: {error}"))),
+            Err(error) => Ok(error_result(format!(
+                "Failed to remove owner: {}",
+                describe_api_error(&error, "change-owners")
+            ))),
         }
     }
 
@@ -153,16 +176,25 @@ impl WriteTools {
             return Ok(error_result(format!("Invalid version: {error}")));
         }
 
-        match self
+        let result = self
             .client
             .set_yanked(&input.name, &input.version, true, input.message.as_deref())
-            .await
-        {
+            .await;
+        self.audited(
+            "yank",
+            &format!("{}@{}", input.name, input.version),
+            result.is_ok(),
+        );
+
+        match result {
             Ok(()) => Ok(success_result(format!(
                 "Yanked {}@{}.",
                 input.name, input.version
             ))),
-            Err(error) => Ok(error_result(format!("Failed to yank version: {error}"))),
+            Err(error) => Ok(error_result(format!(
+                "Failed to yank version: {}",
+                describe_api_error(&error, "yank")
+            ))),
         }
     }
 
@@ -174,16 +206,25 @@ impl WriteTools {
             return Ok(error_result(format!("Invalid version: {error}")));
         }
 
-        match self
+        let result = self
             .client
             .set_yanked(&input.name, &input.version, false, None)
-            .await
-        {
+            .await;
+        self.audited(
+            "unyank",
+            &format!("{}@{}", input.name, input.version),
+            result.is_ok(),
+        );
+
+        match result {
             Ok(()) => Ok(success_result(format!(
                 "Unyanked {}@{}.",
                 input.name, input.version
             ))),
-            Err(error) => Ok(error_result(format!("Failed to unyank version: {error}"))),
+            Err(error) => Ok(error_result(format!(
+                "Failed to unyank version: {}",
+                describe_api_error(&error, "yank")
+            ))),
         }
     }
 
@@ -195,7 +236,8 @@ impl WriteTools {
         match self.client.list_github_configs(&input.name).await {
             Ok(configs) => Ok(success_result(format_github_configs(&input.name, &configs))),
             Err(error) => Ok(error_result(format!(
-                "Failed to list trusted publishing configs: {error}"
+                "Failed to list trusted publishing configs: {}",
+                describe_api_error(&error, "trusted-publishing")
             ))),
         }
     }
@@ -227,7 +269,10 @@ impl WriteTools {
             environment: input.environment.as_deref(),
         };
 
-        match self.client.create_github_config(&config).await {
+        let result = self.client.create_github_config(&config).await;
+        self.audited("create-trustpub", &input.name, result.is_ok());
+
+        match result {
             Ok(created) => Ok(success_result(format!(
                 "Created trusted publishing config #{} for {}/{} (workflow: {}, environment: {}).",
                 created.id,
@@ -237,19 +282,28 @@ impl WriteTools {
                 created.environment.as_deref().unwrap_or("none")
             ))),
             Err(error) => Ok(error_result(format!(
-                "Failed to create trusted publishing config: {error}"
+                "Failed to create trusted publishing config: {}",
+                describe_api_error(&error, "trusted-publishing")
             ))),
         }
     }
 
     async fn delete_trustpub(&self, input: DeleteTrustpubInput) -> Result<CallToolResult> {
-        match self.client.delete_github_config(input.config_id).await {
+        let result = self.client.delete_github_config(input.config_id).await;
+        self.audited(
+            "delete-trustpub",
+            &input.config_id.to_string(),
+            result.is_ok(),
+        );
+
+        match result {
             Ok(()) => Ok(success_result(format!(
                 "Deleted trusted publishing config #{}.",
                 input.config_id
             ))),
             Err(error) => Ok(error_result(format!(
-                "Failed to delete trusted publishing config: {error}"
+                "Failed to delete trusted publishing config: {}",
+                describe_api_error(&error, "trusted-publishing")
             ))),
         }
     }
@@ -259,19 +313,35 @@ impl WriteTools {
             return Ok(error_result(format!("Invalid crate name: {error}")));
         }
 
-        match self
+        let result = self
             .client
             .set_trustpub_only(&input.name, input.trustpub_only)
-            .await
-        {
+            .await;
+        self.audited("set-trustpub-only", &input.name, result.is_ok());
+
+        match result {
             Ok(()) => Ok(success_result(format!(
                 "Set trustpub_only = {} for {}.",
                 input.trustpub_only, input.name
             ))),
             Err(error) => Ok(error_result(format!(
-                "Failed to update trustpub_only: {error}"
+                "Failed to update trustpub_only: {}",
+                describe_api_error(&error, "trusted-publishing")
             ))),
         }
+    }
+}
+
+impl WriteTools {
+    fn audited(&self, action: &str, target: &str, ok: bool) {
+        audit::record_or_warn(
+            &credentials::config_dir(),
+            self.mode.as_str(),
+            action,
+            target,
+            if ok { "ok" } else { "error" },
+            None,
+        );
     }
 }
 

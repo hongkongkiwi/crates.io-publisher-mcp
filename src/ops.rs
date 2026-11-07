@@ -10,6 +10,11 @@ pub const MAX_NAME_LENGTH: usize = 64;
 pub const MAX_VERSION_LENGTH: usize = 150;
 pub const MAX_DESCRIPTION_LENGTH: usize = 1000;
 
+// Pinned action revisions, current as of 2026-11-08. Refresh when upgrading.
+const CHECKOUT_REF: &str = "fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09"; // actions/checkout v5
+const RUST_TOOLCHAIN_REF: &str = "b725eda525362e7cf34af9a7243cac1e3f01a7ec"; // dtolnay/rust-toolchain stable
+const AUTH_ACTION_REF: &str = "3268eb413133e2960fa4ae0e963ca76380c54cd9"; // rust-lang/crates-io-auth-action v1
+
 /// Validate a crate name using the same rules as crates.io.
 ///
 /// Non-empty, at most 64 characters, first character ASCII alphabetic, remaining
@@ -283,6 +288,7 @@ pub struct WorkflowInput {
     pub environment: Option<String>,
     pub run_tests: bool,
     pub locked: bool,
+    pub pin_actions: bool,
     pub overwrite: bool,
 }
 
@@ -402,6 +408,16 @@ pub fn render_workflow(input: &WorkflowInput) -> Result<String> {
     }
 
     let locked = if input.locked { " --locked" } else { "" };
+    let action_ref = |name: &str, pin: &str, tag: &str| {
+        if input.pin_actions {
+            format!("{name}@{pin} # {tag}")
+        } else {
+            format!("{name}@{tag}")
+        }
+    };
+    let checkout = action_ref("actions/checkout", CHECKOUT_REF, "v5");
+    let toolchain = action_ref("dtolnay/rust-toolchain", RUST_TOOLCHAIN_REF, "stable");
+    let auth_action = action_ref("rust-lang/crates-io-auth-action", AUTH_ACTION_REF, "v1");
     let mut out = String::new();
 
     out.push_str("name: Publish\n\n");
@@ -414,14 +430,16 @@ pub fn render_workflow(input: &WorkflowInput) -> Result<String> {
         out.push_str(&format!("    environment: \"{environment}\"\n"));
     }
     out.push_str("    permissions:\n      contents: read\n      id-token: write\n    steps:\n");
-    out.push_str("      - uses: actions/checkout@v4\n\n");
-    out.push_str("      - uses: dtolnay/rust-toolchain@stable\n");
+    out.push_str(&format!("      - uses: {checkout}\n\n"));
+    out.push_str(&format!("      - uses: {toolchain}\n"));
     if input.run_tests {
         out.push_str(&format!(
             "\n      - name: Run tests\n        run: cargo test{locked}\n"
         ));
     }
-    out.push_str("\n      - uses: rust-lang/crates-io-auth-action@v1\n        id: auth\n\n");
+    out.push_str(&format!(
+        "\n      - uses: {auth_action}\n        id: auth\n\n"
+    ));
     out.push_str("      - name: Publish to crates.io\n");
     out.push_str(&format!(
         "        run: cargo publish --registry crates-io{locked}\n"
@@ -677,13 +695,18 @@ impl CargoOps {
             .run(&args, &directory, Some(token), &[token], timeout)
             .await?;
 
+        let mut warnings = preflight.warnings;
+        if !output.success() {
+            warnings.extend(publish_failure_warnings(&output.stderr));
+        }
+
         Ok(PublishOutcome {
             success: output.success(),
             exit_code: output.exit_code(),
             name: preflight.name,
             version: preflight.version,
             dry_run: input.dry_run,
-            warnings: preflight.warnings,
+            warnings,
             stdout_tail: tail(&output.stdout, 40),
             stderr_tail: tail(&output.stderr, 40),
         })
@@ -725,12 +748,35 @@ impl CargoOps {
                     .to_string(),
             );
         }
+        if input.pin_actions {
+            warnings.push(
+                "action revisions are pinned; refresh the SHAs in src/ops.rs when you upgrade an action"
+                    .to_string(),
+            );
+        }
 
         Ok(WorkflowOutcome {
             path,
             content,
             warnings,
         })
+    }
+}
+
+fn publish_failure_warnings(stderr: &str) -> Vec<String> {
+    let lower = stderr.to_ascii_lowercase();
+    let rejected = lower.contains("403 forbidden")
+        || lower.contains("401 unauthorized")
+        || lower.contains("authentication")
+        || lower.contains("unauthorized")
+        || lower.contains("invalid token");
+
+    if rejected {
+        vec![
+            "crates.io rejected the token. It may be missing the `publish-new` scope for a first publish or `publish-update` for a new version, or it may be revoked or expired. Run `crates_auth_status` for the source and recorded scopes.".to_string(),
+        ]
+    } else {
+        Vec::new()
     }
 }
 
@@ -794,6 +840,7 @@ mod tests {
             environment: None,
             run_tests: true,
             locked: false,
+            pin_actions: true,
             overwrite: false,
         }
     }
@@ -867,6 +914,17 @@ mod tests {
         assert_eq!(redact_secrets("no token here", &[""]), "no token here");
     }
 
+    #[test]
+    fn publish_auth_failures_get_a_scope_hint() {
+        let warnings = publish_failure_warnings(
+            "error: the remote server responded with an error (status 403 Forbidden)",
+        );
+
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("publish-new"));
+        assert!(publish_failure_warnings("error: could not compile `demo`").is_empty());
+    }
+
     fn resolved_package() -> ResolvedPackage {
         ResolvedPackage {
             name: "example-crate".to_string(),
@@ -934,7 +992,13 @@ mod tests {
         let workflow = render_workflow(&workflow_input()).unwrap();
 
         assert!(workflow.contains("id-token: write"));
-        assert!(workflow.contains("rust-lang/crates-io-auth-action@v1"));
+        assert!(workflow.contains(&format!(
+            "rust-lang/crates-io-auth-action@{AUTH_ACTION_REF} # v1"
+        )));
+        assert!(workflow.contains(&format!("actions/checkout@{CHECKOUT_REF} # v5")));
+        assert!(workflow.contains(&format!(
+            "dtolnay/rust-toolchain@{RUST_TOOLCHAIN_REF} # stable"
+        )));
         assert!(workflow.contains("CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}"));
         assert!(
             workflow.contains("CARGO_REGISTRIES_CRATES_IO_TOKEN: ${{ steps.auth.outputs.token }}")
@@ -943,6 +1007,18 @@ mod tests {
         assert!(workflow.contains("cargo test"));
         assert!(workflow.contains("cargo publish --registry crates-io"));
         assert!(!workflow.contains("--locked"));
+    }
+
+    #[test]
+    fn workflow_can_use_moving_refs() {
+        let mut input = workflow_input();
+        input.pin_actions = false;
+        let workflow = render_workflow(&input).unwrap();
+
+        assert!(workflow.contains("rust-lang/crates-io-auth-action@v1"));
+        assert!(workflow.contains("actions/checkout@v5"));
+        assert!(workflow.contains("dtolnay/rust-toolchain@stable"));
+        assert!(!workflow.contains(AUTH_ACTION_REF));
     }
 
     #[test]
